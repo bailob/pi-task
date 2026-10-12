@@ -214,13 +214,11 @@ End with a concise, self-contained plain-text or Markdown report. Start with one
  * policy belongs to the host's own system prompt — this description used to
  * restate both, and paid for them on every turn.
  */
-export const TASK_TOOL_DESCRIPTION = `Launch a subagent for a complex, multistep task that benefits from isolated context. The subagent starts with fresh context, so the prompt is the whole handoff — referenced files are evidence, not a handoff.
+export const TASK_TOOL_DESCRIPTION = `Delegate multistep work to a specialist with fresh context. The prompt is the complete handoff; referenced files are evidence, not a handoff.
 
-Not for: file or symbol lookups, 2-3 file edits, or when no agent type fits.
+Not for: file/symbol lookups, 2-3 file edits, or no matching agent.
 
-The child's final message is the result and is not shown to the user, so summarize it yourself. Launch independent agents concurrently and do not duplicate delegated work; review what a writer changed before claiming completion.
-
-Pass task_id to resume a previous subagent session. Background by default; set background false only to wait inline. Results are delivered automatically when ready; do not poll the task or its session file—do other work or end your reply.`;
+Summarize the child result for the user; verify writer changes. Parallelize independent tasks; don't duplicate work. Background by default; background false waits inline. Results arrive automatically: do not poll tasks or session files. Read the task skill for detailed handoffs and examples when available.`;
 
 /** @deprecated Import from ./agent-tools.js */
 export { ALL_TOOL_NAMES } from "./agent-tools.js";

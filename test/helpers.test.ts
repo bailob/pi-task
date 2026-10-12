@@ -1449,24 +1449,26 @@ import {
       );
       assert.match(
         TASK_TOOL_DESCRIPTION,
-        /review what a writer changed/i,
+        /verify writer changes/i,
         t + " requires verification",
       );
+      assert.match(TASK_TOOL_DESCRIPTION, /parallelize independent tasks/i, t + " permits independent concurrency");
+      assert.match(TASK_TOOL_DESCRIPTION, /don't duplicate work/i, t + " prevents redundant delegation");
       assert.match(
         TASK_TOOL_DESCRIPTION,
-        /results are delivered automatically when ready/i,
+        /results arrive automatically/i,
         t + " promises automatic delivery",
       );
       assert.match(
         TASK_TOOL_DESCRIPTION,
-        /do not poll the task or its session file/i,
+        /do not poll tasks or session files/i,
         t + " forbids session polling",
       );
       // Size budget: the description is model-visible on every turn. Keep it
       // tight to protect context. The schema's own contract is asserted in
       // schemaValidation.test.ts.
       assert.ok(
-        TASK_TOOL_DESCRIPTION.length < 800,
+        TASK_TOOL_DESCRIPTION.length < 550,
         `${t}: description stays under the size budget (${TASK_TOOL_DESCRIPTION.length} chars)`,
       );
     }

@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.6] - 2026-10-12
+
+### Added
+
+- Parent-only, on-demand `task` skill for delegation workflows, complete
+  handoffs, reviewer examples, and resumption; also available with `pi -e`.
+
+### Changed
+
+- Shorter task tool and parameter descriptions retain call-time constraints;
+  detailed guidance lives in the skill. Prompt-cost estimates now use compact
+  schema JSON and include skill-listing overhead.
+
 ## [0.11.5] - 2026-10-09
 
 ### Fixed

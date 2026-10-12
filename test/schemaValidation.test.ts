@@ -92,14 +92,15 @@ test("the schema is the only home for the handoff contract", () => {
 
 	// Each field description carries its own rule, so the tool description does
 	// not have to restate it on every turn.
-	assert.match(schema.properties.prompt?.description ?? "", /goal, scope, non-goals, write policy, acceptance criteria, verification recipe/i, "prompt lists the handoff fields");
-	assert.match(schema.properties.parent_context?.description ?? "", /outside the referenced files/i, "parent_context says what belongs in it");
+	assert.match(schema.properties.prompt?.description ?? "", /goal, scope, non-goals, write policy, acceptance, checks/i, "prompt keeps explicit handoff constraints even without the skill");
+	assert.match(schema.properties.parent_context?.description ?? "", /parent-only facts, decisions, constraints/i, "parent_context says what belongs in it");
 	assert.match(schema.properties.parent_context?.description ?? "", /required for reviewer tasks/i, "parent_context names its reviewer requirement");
 	assert.match(schema.properties.proposed_changes?.description ?? "", /required non-empty for reviewer tasks/i, "proposed_changes names its reviewer requirement");
+	assert.match(schema.properties.proposed_changes?.description ?? "", /no design changes/i, "reviewer audits without changes have a valid handoff hint");
 	assert.match(schema.properties.thinking?.description ?? "", /frontmatter wins/i, "thinking states precedence");
 	assert.match(schema.properties.thinking?.description ?? "", /off\|minimal\|low\|medium\|high\|xhigh\|max/i, "thinking lists Pi's levels");
 	assert.match(schema.properties.cwd?.description ?? "", /absolute existing directory/i, "cwd states its validation");
-	assert.match(schema.properties.cwd?.description ?? "", /does not create.*worktree/i, "cwd states the worktree guarantee");
+	assert.match(schema.properties.cwd?.description ?? "", /no worktree creation/i, "cwd states the worktree guarantee");
 });
 
 test("optional fields accept their documented shapes and reject others", () => {

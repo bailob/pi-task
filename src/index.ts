@@ -183,6 +183,12 @@ export default function (pi: ExtensionAPI) {
   registerChildTps(pi);
   if (process.env.PI_TASK_TOOL_DISABLED === "1") return;
 
+  // Pi's resources_discover paths bypass --no-skills, so honor the CLI opt-out here.
+  const skillsDisabled = process.argv.some((arg) => arg === "--no-skills" || arg === "-ns");
+  pi.on("resources_discover", () => skillsDisabled ? undefined : {
+    skillPaths: [join(dirname(TASK_EXTENSION_PATH), "..", "resources", "task", "SKILL.md")],
+  });
+
   const taskToolName = process.env.PI_TASK_TOOL_NAME?.trim() || "task";
   if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(taskToolName)) {
     throw new Error(`Invalid PI_TASK_TOOL_NAME: ${taskToolName}`);

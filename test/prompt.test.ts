@@ -81,7 +81,7 @@ process.on("exit", () => {
   const cwdSchema = startSchema.properties?.cwd;
   assert.ok(cwdSchema, t + " schema");
   assert.match(cwdSchema.description ?? "", /absolute existing directory/i, t + " validation docs");
-  assert.match(cwdSchema.description ?? "", /does not create.*worktree/i, t + " lifecycle docs");
+  assert.match(cwdSchema.description ?? "", /no worktree creation/i, t + " lifecycle docs");
   const promptSchema = schema.properties?.prompt;
   assert.ok(promptSchema, t + " prompt schema");
   assert.match(promptSchema.description ?? "", /parent_context.*proposed_changes/i, t + " handoff docs");

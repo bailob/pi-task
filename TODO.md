@@ -1,5 +1,9 @@
 # TODO
 
+- [x] Prepare verified v0.11.6 with the `task` delegation skill and shorter tool descriptions; 697 tests/typecheck/build/smoke pass and the clean-staged tarball includes the guide. GitHub publication is tracked in [.pi/artifacts/TODO.md](.pi/artifacts/TODO.md); npm publish remains manual.
+
+- [x] Add the on-demand parent `task` skill (`/skill:task`) and shorten task descriptions without changing the API or validation. Child/CLI `--no-skills` isolation and packaging verified; 697 tests/typecheck/build/smoke pass, independent review has no remaining major findings. Estimated always-visible cost ~945 → ~895 tokens including incremental skill metadata; only-skill header and on-demand body cost are reported separately. Live TUI/model behavior remains unverified.
+
 - [x] Align child TPS with the user's main `tps.ts` definition (whole run including tools, minus UI prompt waits), not the per-response metric in GitHub v0.11.4. Local correction passes 682 tests/typecheck/build/smoke; independent review has no blockers, persisted read-only view records TPS (new children only); user live confirmation on a NEW child pending. No further bump/commit/tag/release before the user sees child TPS. Work record: [.pi/artifacts/TODO.md](.pi/artifacts/TODO.md).
 
 - [x] Add authoritative per-response child TPS and prepare verified v0.11.4 with approved picker fixes, advisor example, and prepack cleanup; 678 tests/typecheck/build/smoke pass and independent TPS review has no blockers. Authorized commit/tag/GitHub publication tracked in the work record; npm publish remains manual. Work record: [.pi/artifacts/TODO.md](.pi/artifacts/TODO.md).

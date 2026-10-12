@@ -30,7 +30,7 @@ export function taskParametersSchema() {
     }),
     prompt: Type.String({
       description:
-        "The handoff: goal, scope, non-goals, write policy, acceptance criteria, verification recipe. Parent reasoning learned outside the referenced files goes in parent_context and proposed_changes.",
+        "Handoff: goal, scope, non-goals, write policy, acceptance, checks. Parent-only reasoning: parent_context/proposed_changes.",
     }),
     thinking: Type.Optional(Type.String({
       description: `Thinking; frontmatter wins: ${PI_THINKING_LEVELS.join("|")}`,
@@ -42,26 +42,26 @@ export function taskParametersSchema() {
     ),
     conversation_id: Type.Optional(
       Type.String({
-        description: "Resume a durable conversation by id; it maps to one task id",
+        description: "Start/resume a named conversation on supported backends; not task_id",
       }),
     ),
     parent_context: Type.Optional(
       Type.String({
         description:
-          "Facts, decisions, and constraints the parent learned outside the referenced files. Required for reviewer tasks.",
+          "Parent-only facts, decisions, constraints. Required for reviewer tasks.",
       }),
     ),
     proposed_changes: Type.Optional(
       Type.Array(Type.String(), {
         description:
-          "One item per change: intended semantics and acceptance implication. Required non-empty for reviewer tasks; pass an explicit 'no design changes' item when there are none.",
+          "Changes + acceptance. Required non-empty for reviewer tasks; use 'no design changes' if none.",
       }),
     ),
     workspace_group: Type.Optional(Type.String({
-      description: "Shared HerdR workspace group; same value = panes in one workspace",
+      description: "Group HerdR panes into a shared workspace",
     })),
     cwd: Type.Optional(Type.String({
-      description: "Absolute existing directory for the child. pi-task does not create, merge, or remove worktrees. Defaults to the caller's; a resume reuses the stored one.",
+      description: "Absolute existing directory; default caller, resume uses stored cwd. No worktree creation.",
     })),
     compare: Type.Optional(
       Type.Boolean({

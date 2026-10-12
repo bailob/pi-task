@@ -42,6 +42,16 @@ Restart Pi after installing or changing extension config.
 
 ## Usage
 
+The extension provides an on-demand `task` skill with delegation workflows and
+handoff examples. Pi lists it in parent sessions; `/skill:task` explicitly loads
+it. It also works when loading the extension directly with `pi -e`. Native children
+with delegation disabled and SDK children do not load this guide through the
+extension. `--no-skills` / `-ns` disables it. The schema and runtime validation
+remain usable without the skill. The guide is an extension-provided resource, not
+an auto-discovered package skill, so package `skills` filters do not control it.
+The opt-out checks CLI flags; embedded SDK hosts must handle extension-provided
+resource filtering separately (`noSkills` alone does not filter these paths in Pi 1.1.0).
+
 The handoff contract lives in the `task` schema. Pi validates tool arguments against `parameters` before the tool runs and reports the missing property by name, so `agent_type`, `description`, and `prompt` are enforced rather than merely stated. Runtime validation is the second layer for what the schema cannot express: a stale `operation`, blank strings, thinking values, and the reviewer cross-field requirement. `prompt` carries:
 
 - goal: the exact outcome wanted
