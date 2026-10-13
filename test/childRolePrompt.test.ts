@@ -94,6 +94,8 @@ async function runChild(
     agentDir: string;
     trusted?: boolean;
     prompts?: number;
+    /** Start the first run with a triggerTurn custom message instead of a prompt. */
+    customStart?: boolean;
     sessionManager?: SessionManager;
   },
 ): Promise<ChildRun> {
@@ -139,6 +141,14 @@ async function runChild(
   try {
     await session.bindExtensions({});
     for (let index = 0; index < (options.prompts ?? 1); index += 1) {
+      if (index === 0 && options.customStart) {
+        await session.sendCustomMessage(
+          { customType: "task-wake", content: "wake", display: false },
+          { triggerTurn: true },
+        );
+        await session.agent.waitForIdle();
+        continue;
+      }
       await session.prompt(`turn ${index}`);
     }
     return {
@@ -220,6 +230,17 @@ test("role hook reads flags after registration and supports text-only or forced 
     assert.deepEqual(await hook(forced), { systemPrompt: "FORCED PROMPT\n\nROLE" });
     assert.equal(forced.systemPromptOptions.appendSystemPrompt, "NATIVE");
   });
+});
+
+test("CLI child appends the role to runs started by a custom message", async (t) => {
+  const f = fixture(t);
+  writeFileSync(join(f.agentDir, "APPEND_SYSTEM.md"), "NATIVE");
+  const run = await withEnv(CHILD_ENV, () =>
+    runChild(childArgv("ROLE"), { cwd: f.cwd, agentDir: f.agentDir, customStart: true }),
+  );
+  assert.deepEqual(run.extensionErrors, []);
+  assert.equal(run.addenda.length, 1, "the custom message starts a run");
+  assert.equal(addendumBody(run.addenda[0]), "NATIVE\n\nROLE");
 });
 
 test("child argv no longer suppresses native discovery with --append-system-prompt", () => {
