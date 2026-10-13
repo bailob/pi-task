@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-10-13
+
+### Fixed
+
+- Durable backend tool results use pi-durable 1.2.0's `output` field. 1.2.0
+  renamed `content` to `output` in `ToolExecutionResult`, so adapted parent
+  tools returned a result the harness no longer read. Requires Pi 1.2.0 or
+  newer for the durable backend.
+
+### Changed
+
+- Development dependencies move to Pi 1.2.0 and TypeScript 7.0.2; the
+  removed `pi-server` dev dependency is dropped. Peer ranges are unchanged.
+
 ## [0.11.6] - 2026-10-12
 
 ### Added
