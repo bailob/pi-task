@@ -241,3 +241,30 @@ test("a twin owned by another session never blocks this session", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("adaptAgentTool maps AgentTool content to durable ToolExecutionResult output", async () => {
+  const { adaptAgentTool } = await import("../src/subagent/durable-parent-tools.ts");
+  const content = [{ type: "text" as const, text: "ok" }];
+  const adapted = adaptAgentTool({
+    name: "t",
+    label: "t",
+    description: "d",
+    parameters: {} as never,
+    execute: async () => ({ content, details: {} }),
+  } as never);
+  const api = { callId: "c", output() {} } as never;
+  const ok = (await adapted.execute({}, api, { abortSignal: undefined } as never)) as { output?: unknown };
+  assert.deepEqual(ok.output, content);
+  const failing = adaptAgentTool({
+    name: "t",
+    label: "t",
+    description: "d",
+    parameters: {} as never,
+    execute: async () => {
+      throw new Error("boom");
+    },
+  } as never);
+  const err = (await failing.execute({}, api, { abortSignal: undefined } as never)) as { output?: Array<{ text: string }>; isError?: boolean };
+  assert.equal(err.isError, true);
+  assert.match(err.output?.[0]?.text ?? "", /boom/);
+});

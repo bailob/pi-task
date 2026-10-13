@@ -66,7 +66,7 @@ export function adaptAgentTool(
 				},
 			);
 			return {
-				...(result.content !== undefined ? { content: result.content } : {}),
+				...(result.content !== undefined ? { output: result.content } : {}),
 				...(result.details !== undefined
 					? { details: result.details as never }
 					: {}),
@@ -80,7 +80,7 @@ export function adaptAgentTool(
 			// Durable tools surface failures as error results, not thrown errors.
 			const message = error instanceof Error ? error.message : String(error);
 			return {
-				content: [{ type: "text", text: `Error: ${message}` }],
+				output: [{ type: "text", text: `Error: ${message}` }],
 				details: { error: message },
 				isError: true,
 			};
