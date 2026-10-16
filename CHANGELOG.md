@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-10-16
+
+### Changed
+
+- The `task` tool description no longer lists "file/symbol lookups, 2-3 file
+  edits" under "Not for", leaving only "no matching agent", and the proactive
+  delegation line now reads "when an agent's description matches" instead of
+  "when triggers match". Delegation guidance now rests on agent descriptions
+  rather than a fixed size threshold.
+- Development dependencies move to Pi 1.3.0 (`pi-ai`, `pi-coding-agent`,
+  `pi-tui`, `pi-durable`, `chord`). No runtime changes were needed for Pi
+  1.3.0; peer ranges are unchanged.
+
 ## [0.11.7] - 2026-10-13
 
 ### Fixed

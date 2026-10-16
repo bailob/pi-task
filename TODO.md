@@ -1,5 +1,7 @@
 # TODO
 
+- [x] Prepare v0.11.8: shorter `task` tool description guidance and dev dependencies on Pi 1.3.0; typecheck, tests, build and tarball verified locally. npm publish remains manual.
+
 - [x] Prepare v0.11.7 for Pi 1.2.0: durable tool results use pi-durable's `output` field, dev dependencies on Pi 1.2.0 and TypeScript 7.0.2; typecheck, tests, build and tarball verified locally. npm publish remains manual.
 
 - [x] Prepare verified v0.11.6 with the `task` delegation skill and shorter tool descriptions; 697 tests/typecheck/build/smoke pass and the clean-staged tarball includes the guide. GitHub publication is tracked in [.pi/artifacts/TODO.md](.pi/artifacts/TODO.md); npm publish remains manual.

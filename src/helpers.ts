@@ -216,7 +216,7 @@ End with a concise, self-contained plain-text or Markdown report. Start with one
  */
 export const TASK_TOOL_DESCRIPTION = `Delegate multistep work to a specialist with fresh context. The prompt is the complete handoff; referenced files are evidence, not a handoff.
 
-Not for: file/symbol lookups, 2-3 file edits, or no matching agent.
+Not for: no matching agent.
 
 Summarize the child result for the user; verify writer changes. Parallelize independent tasks; don't duplicate work. Background by default; background false waits inline. Results arrive automatically: do not poll tasks or session files. Read the task skill for detailed handoffs and examples when available.`;
 
@@ -990,7 +990,7 @@ export function buildTaskToolDescription(agents: AgentConfig[]): string {
     proactive.length > 0
       ? [
           "",
-          "PROACTIVE — delegate via task without user @mention when triggers match (see parent APPEND_SYSTEM.md):",
+          "PROACTIVE — delegate via task without user @mention when an agent's description matches (see parent APPEND_SYSTEM.md):",
           ...proactive.map((a) => `- ${a.name}`),
         ].join("\n")
       : "";
