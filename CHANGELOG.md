@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   restarted. Non-fatal harness errors are now logged with a `[pi-task]` prefix.
 - Bridged durable `grep`, `find`, and `ls` run in the child's configured `cwd`
   instead of the parent process's directory.
+- A durable store failure mid-run (`SessionFailed`, for example `SQLITE_BUSY`
+  from a second process holding the write lock) no longer rewrites task history
+  as `failed`. The run stays `running` on disk and the next open resumes it, so
+  the old behavior orphaned a live run that nothing tracked and that could keep
+  editing files after the parent was told it failed. History now stays
+  `running`, the failure notice says the work is kept, and restart recovery
+  delivers the result once.
 
 ### Documentation
 
