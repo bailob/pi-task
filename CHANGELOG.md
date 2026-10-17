@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.9] - 2026-10-17
+
 ### Fixed
 
 - Pi terminal background tasks get a fresh soft turn budget when a session is
