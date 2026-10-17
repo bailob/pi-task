@@ -536,6 +536,11 @@ export async function openDurableHarness(
         models,
         registry,
         settings: { get retry() { return retrySettingsSource(); } },
+        onReport: (error: unknown) => {
+          console.error(
+            `[pi-task] durable harness report: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        },
         env: ({ cwd }: { cwd?: string }) =>
           new NodeExecutionEnv({ cwd: cwd ?? process.cwd() }),
       },
@@ -577,7 +582,15 @@ export async function openDurableHarness(
       ],
     };
   })();
-  harnessCache.set(databasePath, { promise, runtimeModelRegistry, runtimeFast });
+  const entry: CachedHarness = { promise, runtimeModelRegistry, runtimeFast };
+  harnessCache.set(databasePath, entry);
+  // A rejected open or a closed Harness (a storage error closes it, and every
+  // later call rejects with SessionFailed) is unusable: drop it so the next
+  // open reopens the storage instead of reusing the dead handle.
+  const evict = () => {
+    if (harnessCache.get(databasePath) === entry) harnessCache.delete(databasePath);
+  };
+  promise.then((handle) => handle.harness.closed.then(evict, evict), evict);
   return promise;
 }
 

@@ -4299,3 +4299,42 @@ test("a later narrower bridge never evicts tools from a running child", async ()
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a failed harness open is not cached: the next open of the same path recovers", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-task-durable-open-retry-"));
+  const piDir = join(root, ".pi");
+  const blocker = join(root, "storage");
+  const databasePath = join(blocker, "tasks.sqlite");
+  let handle: Awaited<ReturnType<typeof openDurableHarness>> | undefined;
+  try {
+    writeFileSync(blocker, "not a directory");
+    await assert.rejects(openDurableHarness(piDir, { databasePath }));
+
+    rmSync(blocker);
+    mkdirSync(blocker);
+    handle = await openDurableHarness(piDir, { databasePath });
+    assert.ok(await handle.harness.root(handle.context));
+  } finally {
+    if (handle) await handle.harness.close(handle.context);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a closed harness is evicted from the cache: the next open returns a working one", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-task-durable-closed-evict-"));
+  const piDir = join(root, ".pi");
+  const databasePath = join(root, "durable.sqlite");
+  let reopened: Awaited<ReturnType<typeof openDurableHarness>> | undefined;
+  try {
+    const first = await openDurableHarness(piDir, { databasePath });
+    await first.harness.close(first.context);
+    await first.harness.closed;
+
+    reopened = await openDurableHarness(piDir, { databasePath });
+    assert.notEqual(reopened, first);
+    assert.ok(await reopened.harness.root(reopened.context));
+  } finally {
+    if (reopened) await reopened.harness.close(reopened.context);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
