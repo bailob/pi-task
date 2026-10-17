@@ -19,6 +19,7 @@ import type { DeliveryGuard } from "../panel/delivery.js";
 import { durableParentOf } from "./ownership.js";
 import { executeTerminalForegroundTask } from "./terminal-foreground.js";
 import { registerBackgroundTask } from "./background-registration.js";
+import { snapshotPiTurns } from "./turn-budget.js";
 import type { ForegroundProgressPollOptions } from "../tool/foregroundProgress.js";
 
 export interface TerminalExecutionOptions {
@@ -107,6 +108,13 @@ export async function executeTerminalTask({
   const owner = durableParentOf(sessionViewOf(ctx));
   const ownerSessionId = owner.ownerSessionId;
   const ownerLeafId = owner.ownerLeafId;
+  // Per-request soft turn budget (issue #30): a relaunched Pi session already
+  // holds turns from earlier requests. Snapshot them BEFORE the launch so the
+  // new child's own turns are never baselined. Claude counting is unchanged.
+  const turnBaseline =
+    claudeRuntime || foregroundTask
+      ? 0
+      : snapshotPiTurns(artifactsDir, id, sessionName);
   let paneId: string;
   let originalPane: string | null;
   let handle: TerminalHandle;
@@ -218,6 +226,7 @@ export async function executeTerminalTask({
     toolUses: 0,
     turns: 0,
     maxTurns: agentMaxTurns?.() ?? envTurnLimit(),
+    ...(turnBaseline > 0 ? { turnBaseline } : {}),
     conversationId,
     ownerSessionId,
     ownerLeafId,

@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Pi terminal background tasks get a fresh soft turn budget when a session is
+  resumed or an explicit follow-up is delivered successfully (#30). Historical turns
+  no longer immediately trigger another wrap-up. Lifetime statistics and hard
+  timeout anchors stay unchanged; request-budget and wrap-up state are recorded
+  for restoration after a parent restart.
+
 ## [0.11.8] - 2026-10-16
 
 ### Changed

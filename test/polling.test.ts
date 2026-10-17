@@ -15,7 +15,7 @@
 
 import { strict as assert } from "node:assert";
 import { setTimeout as sleep } from "node:timers/promises";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { BACKGROUND_POLL_CONCURRENCY } from "../src/constants.js";
@@ -25,6 +25,10 @@ import { startBackgroundPolling } from "../src/lifecycle/polling.js";
 import { startToolStatsPolling } from "../src/lifecycle/toolStats.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+// Wrap-up persistence writes the durable registry; keep it off the real /tmp.
+const POLL_PI_DIR = mkdtempSync(join(tmpdir(), "pi-task-poll-pidir-"));
+process.on("exit", () => rmSync(POLL_PI_DIR, { recursive: true, force: true }));
 
 function makeDeps(
   overrides: Partial<{
@@ -46,7 +50,7 @@ function makeDeps(
     completeTask: () => {},
     hardTimeoutMs: 10_000,
     MAX_POLL_ERRORS: 3,
-    piDir: "/tmp",
+    piDir: POLL_PI_DIR,
     pi: { __pi: "captured" },
     ...overrides,
   };
@@ -562,7 +566,6 @@ function makeDeps(
   assert.equal(completeCount, 0, `${t}: stale completion must be ignored`);
 }
 
-console.log("ALL POLLING TESTS PASSED");
 
 {
   const t = "completeTask throwing inside tick never becomes an unhandled rejection and keeps polling";
@@ -1103,3 +1106,299 @@ function claudeAssistant(stopReason: string | null): Record<string, unknown> {
   assert.equal(task.turns, 3, `${t}: durable turn count stays event-owned`);
   assert.equal(task.recentCalls[0]?.status, "in_progress", `${t}: active tool state remains visible`);
 }
+
+// ─── Per-request turn budget (issue #30) ───────────────────────────────────
+
+function assistantTurnLine(text: string): string {
+  return JSON.stringify({
+    type: "message",
+    timestamp: new Date().toISOString(),
+    message: { role: "assistant", content: [{ type: "text", text }] },
+  }) + "\n";
+}
+
+function writeTurns(dir: string, sessionName: string, count: number): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `${sessionName}.jsonl`),
+    JSON.stringify({ type: "session_info", name: sessionName }) + "\n" +
+    Array.from({ length: count }, (_, i) => assistantTurnLine(`turn ${i}`)).join(""),
+  );
+}
+
+function appendTurns(dir: string, sessionName: string, count: number): void {
+  appendFileSync(
+    join(dir, `${sessionName}.jsonl`),
+    Array.from({ length: count }, (_, i) => assistantTurnLine(`new ${i}`)).join(""),
+  );
+}
+
+function registryEntryFor(root: string, id: string, extra: Record<string, unknown> = {}) {
+  return {
+    id,
+    agentType: "general",
+    description: "turn budget",
+    sessionName: "task-lim",
+    startedAt: Date.now() - 1000,
+    piDir: root,
+    dir: join(root, "artifacts"),
+    ...extra,
+  };
+}
+
+const scenarioFailures: string[] = [];
+async function scenario(run: () => Promise<void>): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    scenarioFailures.push(error instanceof Error ? error.message : String(error));
+  }
+}
+
+await scenario(async () => {
+  const t = "the soft limit counts turns since the request baseline, not lifetime turns";
+  const root = mkdtempSync(join(tmpdir(), "pi-task-poll-baseline-"));
+  try {
+    const sessionDir = join(root, "artifacts", "sessions", "t1");
+    writeTurns(sessionDir, "task-lim", 3); // historic turns from earlier requests
+    const task = makeTurnTask({
+      dir: join(root, "artifacts"),
+      maxTurns: 3,
+      turns: 0,
+      turnBaseline: 3,
+    });
+    const backgroundTasks = new Map<string, any>([["t1", task]]);
+    const steered: string[] = [];
+    let completions = 0;
+    const statsStop = startToolStatsPolling(new Map(), backgroundTasks, 5);
+    const stop = startBackgroundPolling(
+      makeDeps({
+        backgroundTasks,
+        piDir: root,
+        steerTask: (_task: any, prompt: string) => {
+          steered.push(prompt);
+          return true;
+        },
+        checkTaskCompletion: async () => ({ status: "running", content: "" }),
+        completeTask: () => {
+          completions += 1;
+        },
+      }),
+      10,
+    );
+    try {
+      await sleep(80);
+      assert.equal(task.turns, 3, `${t}: lifetime turns stay lifetime`);
+      assert.equal(steered.length, 0, `${t}: historic turns do not trigger the wrap-up`);
+      appendTurns(sessionDir, "task-lim", 2);
+      await sleep(80);
+      assert.equal(task.turns, 5, `${t}: tracker counts lifetime turns`);
+      assert.equal(steered.length, 0, `${t}: 2 new turns are below the 3-turn limit`);
+      appendTurns(sessionDir, "task-lim", 1);
+      await sleep(80);
+    } finally {
+      clearInterval(statsStop);
+      stop();
+    }
+    assert.equal(steered.length, 1, `${t}: wrap-up fires after 3 new turns`);
+    assert.deepEqual(task.wrapUp, { turnsAtStart: 6 }, `${t}: anchor stays in lifetime units`);
+    assert.equal(completions, 0, `${t}: grace keeps the task running`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+await scenario(async () => {
+  const t = "wrap-up grace stays in absolute lifetime turns with a request baseline";
+  const root = mkdtempSync(join(tmpdir(), "pi-task-poll-grace-abs-"));
+  try {
+    writeTurns(join(root, "artifacts", "sessions", "t1"), "task-lim", 1);
+    const task = makeTurnTask({
+      dir: join(root, "artifacts"),
+      maxTurns: 3,
+      turns: 14,
+      turnBaseline: 10,
+      wrapUp: { turnsAtStart: 13 },
+    });
+    const backgroundTasks = new Map<string, any>([["t1", task]]);
+    let settled = 0;
+    const stop = startBackgroundPolling(
+      makeDeps({
+        backgroundTasks,
+        piDir: root,
+        checkTaskCompletion: async () => ({ status: "running", content: "" }),
+        completeTask: () => {
+          settled += 1;
+        },
+      }),
+      10,
+    );
+    try {
+      await sleep(60);
+      assert.equal(settled, 0, `${t}: 1 turn after the anchor is within grace`);
+      task.turns = 23; // anchor 13 + WRAP_UP_GRACE_TURNS
+      await sleep(60);
+    } finally {
+      stop();
+    }
+    assert.equal(settled, 1, `${t}: settles once absolute grace is exhausted`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+await scenario(async () => {
+  const t = "wrap-up state is persisted before the steer is sent";
+  const root = mkdtempSync(join(tmpdir(), "pi-task-poll-persist-"));
+  try {
+    const registryFile = join(root, "task-registry.json");
+    writeFileSync(registryFile, JSON.stringify([registryEntryFor(root, "t1", { maxTurns: 3 })]));
+    writeTurns(join(root, "artifacts", "sessions", "t1"), "task-lim", 5);
+    const task = makeTurnTask({
+      dir: join(root, "artifacts"),
+      maxTurns: 3,
+      turns: 5,
+      turnBaseline: 2,
+    });
+    const backgroundTasks = new Map<string, any>([["t1", task]]);
+    let registryAtSteer: any;
+    let steers = 0;
+    const stop = startBackgroundPolling(
+      makeDeps({
+        backgroundTasks,
+        piDir: root,
+        steerTask: () => {
+          steers += 1;
+          registryAtSteer = JSON.parse(readFileSync(registryFile, "utf8"))[0];
+          return true;
+        },
+        checkTaskCompletion: async () => ({ status: "running", content: "" }),
+      }),
+      10,
+    );
+    try {
+      await sleep(80);
+    } finally {
+      stop();
+    }
+    assert.equal(steers, 1, `${t}: steered once`);
+    assert.deepEqual(registryAtSteer?.wrapUp, { turnsAtStart: 5 }, `${t}: registry already holds wrapUp at steer time`);
+    const final = JSON.parse(readFileSync(registryFile, "utf8"))[0];
+    assert.equal(final.maxTurns, 3, `${t}: other registry fields untouched`);
+    assert.equal(final.dir, join(root, "artifacts"), `${t}: registry entry otherwise intact`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+await scenario(async () => {
+  const t = "a failing wrap-up persistence write still steers (once) instead of looping";
+  const root = mkdtempSync(join(tmpdir(), "pi-task-poll-persistfail-"));
+  try {
+    writeFileSync(join(root, "task-registry.json"), "{not-json");
+    writeTurns(join(root, "artifacts", "sessions", "t1"), "task-lim", 5);
+    const task = makeTurnTask({
+      dir: join(root, "artifacts"),
+      maxTurns: 3,
+      turns: 5,
+    });
+    const backgroundTasks = new Map<string, any>([["t1", task]]);
+    let steers = 0;
+    let completions = 0;
+    const stop = startBackgroundPolling(
+      makeDeps({
+        backgroundTasks,
+        piDir: root,
+        steerTask: () => {
+          steers += 1;
+          return true;
+        },
+        checkTaskCompletion: async () => ({ status: "running", content: "" }),
+        completeTask: () => {
+          completions += 1;
+        },
+      }),
+      10,
+    );
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      await sleep(120);
+    } finally {
+      console.error = originalError;
+      stop();
+    }
+    assert.equal(steers, 1, `${t}: steered exactly once despite the write failure`);
+    assert.equal(completions, 0, `${t}: no poll-error settlement`);
+    assert.deepEqual(task.wrapUp, { turnsAtStart: 5 }, `${t}: in-memory wrap-up recorded`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+await scenario(async () => {
+  const t = "a stale polled task never steers, persists, or overwrites a renewed budget";
+  const root = mkdtempSync(join(tmpdir(), "pi-task-poll-stale-"));
+  try {
+    const registryFile = join(root, "task-registry.json");
+    const initialRegistry = JSON.stringify([registryEntryFor(root, "t1", { turnBaseline: 10 })]);
+    writeFileSync(registryFile, initialRegistry);
+    writeTurns(join(root, "artifacts", "sessions", "t1"), "task-lim", 10);
+    const stale = makeTurnTask({ dir: join(root, "artifacts"), maxTurns: 3, turns: 10 });
+    const renewed = makeTurnTask({
+      dir: join(root, "artifacts"),
+      maxTurns: 3,
+      turns: 10,
+      turnBaseline: 10,
+    });
+    const backgroundTasks = new Map<string, any>();
+    // Fill every worker with a gated sibling so the target is dequeued only
+    // after the map entry has been replaced.
+    const blockers = Array.from({ length: BACKGROUND_POLL_CONCURRENCY }, (_, i) => `blocker-${i}`);
+    for (const id of blockers) backgroundTasks.set(id, makeTurnTask({ dir: join(root, "artifacts") }));
+    backgroundTasks.set("t1", stale);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const steered: string[] = [];
+    const stop = startBackgroundPolling(
+      makeDeps({
+        backgroundTasks,
+        piDir: root,
+        steerTask: (_task: any, prompt: string) => {
+          steered.push(prompt);
+          return true;
+        },
+        checkTaskCompletion: async ({ taskId }: any) => {
+          if (blockers.includes(taskId)) await gate;
+          return { status: "running", content: "" };
+        },
+      }),
+      10,
+    );
+    try {
+      await sleep(40);
+      backgroundTasks.set("t1", renewed);
+      release();
+      await sleep(80);
+    } finally {
+      release();
+      stop();
+    }
+    assert.equal(steered.length, 0, `${t}: no steer from the stale or renewed task`);
+    assert.equal(stale.wrapUp, undefined, `${t}: stale object takes no wrap-up state`);
+    assert.equal(renewed.wrapUp, undefined, `${t}: renewed budget untouched`);
+    assert.equal(readFileSync(registryFile, "utf8"), initialRegistry, `${t}: registry untouched`);
+    assert.equal(backgroundTasks.get("t1"), renewed, `${t}: renewed task stays tracked`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+if (scenarioFailures.length > 0) {
+  for (const failure of scenarioFailures) console.error(`FAIL: ${failure}`);
+  throw new Error(`${scenarioFailures.length} per-request turn budget scenario(s) failed`);
+}
+
+console.log("ALL POLLING TESTS PASSED");

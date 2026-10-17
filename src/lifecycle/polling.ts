@@ -19,6 +19,7 @@ import type {
 } from "../subagent/waitCompletion.js";
 import { taskRuntime, type BackgroundTask } from "../types.js";
 import { completeTask, type ComparisonSettledHook } from "./completion.js";
+import { persistTurnBudget } from "./turn-budget.js";
 
 export interface BackgroundPollingDeps {
   backgroundTasks: Map<string, BackgroundTask>;
@@ -141,8 +142,14 @@ export function startBackgroundPolling(
       // Turn-based soft limit (issue #19): steer a wrap-up at the limit,
       // allow a bounded grace of further turns, then settle with whatever
       // the subagent produced instead of discarding it. SDK tasks are
-      // skipped above (no terminal session to steer).
+      // skipped above (no terminal session to steer). The limit counts the
+      // turns of the current request (issue #30: lifetime turns minus the
+      // request baseline); the wrap-up anchor and grace window stay in
+      // absolute lifetime turns.
       if (task.maxTurns !== undefined) {
+        // This worker may have awaited siblings since the tick snapshot; a
+        // replaced tracker owns the (possibly renewed) budget now.
+        if (deps.backgroundTasks.get(id) !== task) return;
         const readPartial = () =>
           taskRuntime(task) === "claude"
             ? getLastClaudeAssistantText(
@@ -161,8 +168,19 @@ export function startBackgroundPolling(
             `${readPartial() || "No assistant output captured."}\n\nTask reached the ${task.maxTurns}-turn limit${reason}`,
             "timeout",
           );
-        if (!task.wrapUp && task.turns >= task.maxTurns) {
+        if (!task.wrapUp && Math.max(0, task.turns - (task.turnBaseline ?? 0)) >= task.maxTurns) {
           task.wrapUp = { turnsAtStart: task.turns };
+          // Persist before steering so a same-run restart does not regrant
+          // the grace window. Best-effort: a registry failure must neither
+          // skip the steer nor reach the poll-error path (the in-memory flag
+          // is already set, so a retry would never steer).
+          try {
+            persistTurnBudget(deps.piDir, id, { wrapUp: task.wrapUp });
+          } catch (error) {
+            console.error(
+              `[pi-task] background task ${id} wrap-up state was not persisted: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
           const steered = await (deps.steerTask?.(task, turnLimitWrapUpPrompt(task.maxTurns)) ?? false);
           if (!steered) {
             if (deps.backgroundTasks.get(id) !== task) return;

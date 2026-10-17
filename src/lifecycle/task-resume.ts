@@ -19,6 +19,11 @@ import { sessionViewOf } from "../panel/delivery.js";
 import type { DeliveryGuard } from "../panel/delivery.js";
 import { durableParentOf, transferTaskOwnership } from "./ownership.js";
 import { steerRunningBackgroundTask } from "../subagent/steer.js";
+import {
+  carriedTrackerState,
+  grantFollowUpBudget,
+  snapshotPiTurns,
+} from "./turn-budget.js";
 
 export interface TaskResumeResult {
   content: [{ type: "text"; text: string }];
@@ -201,6 +206,12 @@ export function resolveTaskResume({
         },
       };
     }
+    // The reattached tracker replaces any in-memory one: carry its lifetime
+    // counters and request budget through, so a failed follow-up changes
+    // nothing. The lifetime turn count is snapshotted BEFORE the synchronous
+    // steer so the child's reaction to the follow-up is never baselined.
+    const prior = backgroundTasks.get(id);
+    const turnSnapshot = snapshotPiTurns(artifactsDir, id, sessionName);
     const bgtask: BackgroundTask = {
       dir: artifactsDir,
       cwd: entry.cwd,
@@ -212,12 +223,10 @@ export function resolveTaskResume({
       originalPane: null,
       description: taskParams.description || entry.description,
       startedAt: entry.startedAt,
-      toolUses: 0,
-      turns: 0,
       maxTurns: entry.maxTurns,
       conversationId: entry.conversationId,
       ...durableParentOf(sessionViewOf(ctx)),
-      recentCalls: [],
+      ...carriedTrackerState(prior, registryEntry),
     };
     backgroundTasks.set(id, bgtask);
     deliveryGuard.track(id, sessionViewOf(ctx));
@@ -241,6 +250,10 @@ export function resolveTaskResume({
         },
       };
     }
+
+    // The follow-up is delivered: it is a new explicit request, so renew the
+    // soft turn budget (never on a failed steer). Persistence is best-effort.
+    grantFollowUpBudget(extensionPiDir, id, bgtask, turnSnapshot);
 
     return {
       kind: "handled",

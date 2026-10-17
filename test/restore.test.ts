@@ -1041,3 +1041,77 @@ describe("claude restart recovery (issue #22)", () => {
     );
   });
 });
+
+describe("restoreActiveBackgroundTasks turn budget (issue #30)", () => {
+  function budgetEntry(piDir: string, extra: Record<string, unknown> = {}) {
+    const dir = join(piDir, "artifacts");
+    mkdirSync(dir, { recursive: true });
+    return {
+      id: "task-budget",
+      dir,
+      sessionName: "task-task-budget",
+      startedAt: 1_700_000_000_000,
+      paneId: "%alive",
+      agentType: "scout",
+      description: "budget task",
+      maxTurns: 5,
+      ...extra,
+    };
+  }
+
+  it("restores the persisted baseline and wrap-up anchor without renewing the budget", async () => {
+    const piDir = makePiDir();
+    writeJson(join(piDir, "task-registry.json"), [
+      budgetEntry(piDir, { turnBaseline: 4, wrapUp: { turnsAtStart: 7 } }),
+    ]);
+
+    const backgroundTasks = new Map();
+    await restoreActiveBackgroundTasks(piDir, backgroundTasks, () => true);
+
+    const restored = backgroundTasks.get("task-budget");
+    assert.ok(restored, "task restored");
+    assert.equal(restored.turnBaseline, 4);
+    assert.deepEqual(restored.wrapUp, { turnsAtStart: 7 });
+    assert.equal(restored.startedAt, 1_700_000_000_000, "startedAt is not reset");
+    assert.equal(restored.maxTurns, 5);
+    // The registry keeps the budget fields for the next restart.
+    const [persisted] = readJson<Array<Record<string, unknown>>>(join(piDir, "task-registry.json"));
+    assert.equal(persisted?.turnBaseline, 4);
+    assert.deepEqual(persisted?.wrapUp, { turnsAtStart: 7 });
+  });
+
+  it("treats legacy entries without budget fields as baseline 0 and no wrap-up", async () => {
+    const piDir = makePiDir();
+    writeJson(join(piDir, "task-registry.json"), [budgetEntry(piDir)]);
+
+    const backgroundTasks = new Map();
+    await restoreActiveBackgroundTasks(piDir, backgroundTasks, () => true);
+
+    const restored = backgroundTasks.get("task-budget");
+    assert.ok(restored, "legacy task restored");
+    assert.strictEqual(restored.turnBaseline, 0);
+    assert.strictEqual(restored.wrapUp, undefined);
+  });
+
+  it("falls back to baseline 0 / no wrap-up for invalid persisted values", async () => {
+    const invalid: Array<Record<string, unknown>> = [
+      { turnBaseline: -1, wrapUp: { turnsAtStart: -1 } },
+      { turnBaseline: "5", wrapUp: { turnsAtStart: "3" } },
+      { turnBaseline: null, wrapUp: 4 },
+      { turnBaseline: 2.5e400, wrapUp: { turnsAtStart: null } }, // Infinity serializes to null
+      { turnBaseline: { n: 1 }, wrapUp: {} },
+    ];
+    for (const extra of invalid) {
+      const piDir = makePiDir();
+      writeJson(join(piDir, "task-registry.json"), [budgetEntry(piDir, extra)]);
+
+      const backgroundTasks = new Map();
+      await restoreActiveBackgroundTasks(piDir, backgroundTasks, () => true);
+
+      const restored = backgroundTasks.get("task-budget");
+      assert.ok(restored, `restored for ${JSON.stringify(extra)}`);
+      assert.strictEqual(restored.turnBaseline, 0, `baseline for ${JSON.stringify(extra)}`);
+      assert.strictEqual(restored.wrapUp, undefined, `wrapUp for ${JSON.stringify(extra)}`);
+    }
+  });
+});

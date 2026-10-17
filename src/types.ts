@@ -116,9 +116,15 @@ export interface BackgroundTask {
   /** Soft turn limit (issue #19); undefined = unlimited. */
   maxTurns?: number;
   /**
-   * Wrap-up phase (issue #19): anchored at the turn count observed when the
-   * limit was reached; the polling loop closes the task after
-   * WRAP_UP_GRACE_TURNS further completed turns.
+   * Lifetime Pi turn count at the start of the current explicit request
+   * (issue #30). `turns` stays lifetime; the soft limit applies to
+   * `turns - turnBaseline`. Absent = 0 (whole session counts).
+   */
+  turnBaseline?: number;
+  /**
+   * Wrap-up phase (issue #19): anchored at the lifetime turn count observed
+   * when the limit was reached; the polling loop closes the task after
+   * WRAP_UP_GRACE_TURNS further completed turns (absolute lifetime units).
    */
   wrapUp?: { turnsAtStart: number };
   conversationId?: string;
@@ -177,6 +183,10 @@ export interface RegistryEntry {
   sessionRef?: string;
   /** Soft turn limit persisted so restore keeps enforcing it (issue #19). */
   maxTurns?: number;
+  /** Lifetime turn count at the start of the current request (issue #30); absent/invalid = 0. */
+  turnBaseline?: number;
+  /** Wrap-up anchor (lifetime turns) persisted so a same-run restart does not regrant grace. */
+  wrapUp?: { turnsAtStart: number };
   /**
    * Pi session that owns this task's lifecycle (issue #20): only it may
    * restore, steer, time out, deliver, or remove the entry. Undefined on

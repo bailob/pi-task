@@ -46,6 +46,7 @@ export function registerBackgroundTask({
     conversationId: task.conversationId,
     ...(task.intentHash !== undefined ? { intentHash: task.intentHash } : {}),
     maxTurns: task.maxTurns,
+    ...(task.turnBaseline !== undefined ? { turnBaseline: task.turnBaseline } : {}),
     ownerSessionId: task.ownerSessionId,
     ownerLeafId: task.ownerLeafId,
     ownerPid: process.pid,

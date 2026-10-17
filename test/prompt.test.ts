@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { setTimeout as sleep } from "node:timers/promises";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1154,20 +1154,22 @@ if (process.platform !== "win32") {
     // Simulate one completed assistant turn in the child session JSONL.
     // The explicit conversation_id makes sessionName = conversationId.
     const sessionDir = join(root, ".pi", "artifacts", "tasks", "sessions", id!);
-    mkdirSync(sessionDir, { recursive: true });
-    writeFileSync(
-      join(sessionDir, "conv-turns-1.jsonl"),
-      JSON.stringify({ type: "session_info", name: "conv-turns-1" }) + "\n" +
+    const sessionFile = join(sessionDir, "conv-turns-1.jsonl");
+    const assistantTurn = (text: string) =>
       JSON.stringify({
         type: "message",
         timestamp: new Date().toISOString(),
-        message: { role: "assistant", content: [{ type: "text", text: "turn one" }] },
-      }) + "\n",
+        message: { role: "assistant", content: [{ type: "text", text }] },
+      }) + "\n";
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      sessionFile,
+      JSON.stringify({ type: "session_info", name: "conv-turns-1" }) + "\n" + assistantTurn("turn one"),
     );
 
     // Resume via conversation_id: the reattached tracker must restore
-    // maxTurns from the registry entry, so the polling loop steers a wrap-up
-    // once the recounted turn count reaches the limit.
+    // maxTurns from the registry entry. The soft limit (issue #30) counts only
+    // turns of THIS request: the historic turn must not trigger a wrap-up.
     const resumeOne = await tool.execute(
       "resume-turns-2",
       { ...base, conversation_id: "conv-turns-1" },
@@ -1181,6 +1183,17 @@ if (process.platform !== "win32") {
     await sleep(14000); // BACKGROUND_CHECK_MS tick + COUNT_POLL_MS recount
 
     let log = readFileSync(tmuxLog, "utf8");
+    assert.equal(
+      (log.match(/turn soft limit/g) ?? []).length,
+      0,
+      t + ` historic turns do not wrap up a freshly resumed request (steer log: ${log.slice(-400)})`,
+    );
+
+    // One new completed turn reaches the 1-turn limit of this request.
+    appendFileSync(sessionFile, assistantTurn("turn two"));
+    await sleep(14000);
+
+    log = readFileSync(tmuxLog, "utf8");
     const steerOne = (log.match(/turn soft limit/g) ?? []).length;
     assert.ok(steerOne >= 1, t + ` conversation resume enforces the limit (steer log: ${log.slice(-400)})`);
 
@@ -1194,6 +1207,8 @@ if (process.platform !== "win32") {
     );
     assert.equal(resumeTwo.isError, undefined, t + " task_id resume");
 
+    // The follow-up renewed the budget: one new turn is needed again.
+    appendFileSync(sessionFile, assistantTurn("turn three"));
     await sleep(14000);
 
     log = readFileSync(tmuxLog, "utf8");
