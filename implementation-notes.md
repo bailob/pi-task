@@ -184,5 +184,5 @@ off the table; the spike doc records the decision and the tracked gaps.
 
 ### Remaining gaps (tracked in the spike doc)
 
-- Usage is not read on failure paths (failed runs report no ledger).
+- Usage on failure paths: closed; failed and cancelled runs read the committed ledger when it is readable.
 - Steer/abort racing the mapping-doc commit window remains untested.

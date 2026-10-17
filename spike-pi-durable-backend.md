@@ -96,8 +96,9 @@ agent frontmatter can still select a specific provider/model.
 Remaining gaps, tracked and unscheduled:
 - Deferred provider responses: Pi's public extension `ModelRegistry` does not
   expose deferred fetch/cancel, so the durable bridge rejects that capability.
-- Usage on failure paths: recovered/finished runs surface the child's
-  `pi.usage` ledger in receipts; failed runs do not read it yet.
+- Usage on failure paths: closed. Finished, failed, and cancelled runs surface
+  the child's `pi.usage` ledger in receipts (`durable.ts` `reportFailure`;
+  `test/durableBackend.test.ts` "failed run reports its committed usage ledger").
 - Multi-surface (remote clients steering the same durable conversation) is
   future work, not started.
 

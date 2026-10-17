@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The durable backend reopens its harness after a failed open or a closed
+  session. A rejected open and a harness closed by a storage error stayed
+  cached for the whole Pi process, so every later durable task failed until Pi
+  restarted. Non-fatal harness errors are now logged with a `[pi-task]` prefix.
+- Bridged durable `grep`, `find`, and `ls` run in the child's configured `cwd`
+  instead of the parent process's directory.
+
+### Documentation
+
+- The durable docs no longer list usage on failure paths as an open gap, and
+  the README states that durable storage survives process death but can lose
+  the newest commit on power or host failure.
+
 ## [0.11.9] - 2026-10-17
 
 ### Fixed
