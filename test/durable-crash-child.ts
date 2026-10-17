@@ -4,7 +4,11 @@
  * whose faux model calls the real `bash` tool with a long sleep, so the
  * parent can SIGKILL this process mid-tool-call.
  *
- * Usage: tsx test/durable-crash-child.ts <databasePath> <piDir> <taskId>
+ * Usage: tsx test/durable-crash-child.ts <databasePath> <piDir> <taskId> [toolStartedPath]
+ *
+ * When `toolStartedPath` is given, the bash command creates that file as its
+ * first step, so the parent can wait for proof that the tool is running instead
+ * of sleeping and hoping.
  */
 
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -15,9 +19,9 @@ import {
 } from "@earendil-works/pi-ai/providers/faux";
 import { durableRequestId, runDurableTask } from "../src/subagent/durable.js";
 
-const [databasePath, piDir, taskId] = process.argv.slice(2);
+const [databasePath, piDir, taskId, toolStartedPath] = process.argv.slice(2);
 if (!databasePath || !piDir || !taskId) {
-  console.error("usage: durable-crash-child.ts <databasePath> <piDir> <taskId>");
+  console.error("usage: durable-crash-child.ts <databasePath> <piDir> <taskId> [toolStartedPath]");
   process.exit(1);
 }
 
@@ -29,7 +33,11 @@ models.setProvider(faux.provider);
 // the model the call was interrupted instead of rerunning the sleep.
 faux.setResponses([
   fauxAssistantMessage(
-    [fauxToolCall("bash", { command: "sleep 30" })],
+    [
+      fauxToolCall("bash", {
+        command: toolStartedPath ? `touch ${JSON.stringify(toolStartedPath)} && sleep 30` : "sleep 30",
+      }),
+    ],
     { stopReason: "toolUse" },
   ),
 ]);

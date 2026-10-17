@@ -8,7 +8,7 @@
 
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,6 +66,15 @@ function withEnv(values: Record<string, string | undefined>, run: () => Promise<
       else process.env[key] = value;
     }
   });
+}
+
+/** Poll for a marker file a child writes once its tool is running. */
+async function waitForFile(path: string, timeoutMs = 20_000): Promise<void> {
+  for (let waited = 0; waited < timeoutMs; waited += 20) {
+    if (existsSync(path)) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`timed out waiting for ${path}`);
 }
 
 const makeModels = (steps: string[]) => () => {
@@ -2707,9 +2716,10 @@ test("session_start reconciles stale SDK siblings before replaying their compari
       ownerSessionId: "sess-other",
     });
 
+    const toolStartedPath = join(root, "tool-started");
     const crash = spawn(
       process.execPath,
-      ["--import", "tsx", crashScript, databasePath, piDir, taskId],
+      ["--import", "tsx", crashScript, databasePath, piDir, taskId, toolStartedPath],
       { env: process.env, stdio: ["ignore", "pipe", "inherit"] },
     );
     crashChild = crash;
@@ -2722,7 +2732,7 @@ test("session_start reconciles stale SDK siblings before replaying their compari
       crash.on("exit", (code) => reject(new Error(`crash child exited early: ${code}`)));
       setTimeout(() => reject(new Error("crash child never submitted")), 20_000).unref();
     });
-    await new Promise((resolve) => setTimeout(resolve, 1_500)); // land mid-tool
+    await waitForFile(toolStartedPath);
     const crashExit = new Promise<void>((resolve) => crash.once("exit", () => resolve()));
     crash.kill("SIGKILL");
     await crashExit;
@@ -3595,9 +3605,10 @@ test("SIGKILL mid-tool: the next process resumes and delivers exactly once", () 
     });
 
     // 1. The child starts a durable task and gets stuck inside `bash sleep 30`.
+    const toolStartedPath = join(root, "tool-started");
     const child = spawn(
       process.execPath,
-      ["--import", "tsx", childScript, databasePath, piDir, "t-crash"],
+      ["--import", "tsx", childScript, databasePath, piDir, "t-crash", toolStartedPath],
       { env: process.env, stdio: ["ignore", "pipe", "inherit"] },
     );
     await new Promise<void>((resolve, reject) => {
@@ -3609,7 +3620,7 @@ test("SIGKILL mid-tool: the next process resumes and delivers exactly once", () 
       child.on("exit", (code) => reject(new Error(`child exited early: ${code}`)));
       setTimeout(() => reject(new Error("child never submitted")), 20_000).unref();
     });
-    await new Promise((resolve) => setTimeout(resolve, 1_500)); // land mid-tool
+    await waitForFile(toolStartedPath);
     child.kill("SIGKILL");
     await new Promise<void>((resolve) => child.on("exit", () => resolve()));
 
