@@ -186,3 +186,4 @@ off the table; the spike doc records the decision and the tracked gaps.
 
 - Usage on failure paths: closed; failed and cancelled runs read the committed ledger when it is readable.
 - Steer/abort racing the mapping-doc commit window remains untested.
+- A background task's history is written `done` before its completion notice is persisted to the Pi session, and shutdown drops queued notices, so a notice can be lost if Pi exits in that gap. Recovery only claims `running` rows, so it is not redelivered. Fixing it needs a per-task delivered marker plus a startup replay shared by all backends; deferred until a real report.

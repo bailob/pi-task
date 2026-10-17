@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The durable docs no longer list usage on failure paths as an open gap, and
   the README states that durable storage survives process death but can lose
   the newest commit on power or host failure.
+- The README documents a known limit: a background completion notice can be
+  lost if Pi exits after the task is recorded `done` but before the notice is
+  saved to the session. The task and its result stay available.
 
 ## [0.11.9] - 2026-10-17
 
