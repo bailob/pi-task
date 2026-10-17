@@ -42,6 +42,12 @@ export interface SdkBackgroundTaskInput<
   deliver?: (delivery: () => CompletionDeliveryOutcome | void) => void;
   onComplete?: (result: TResult) => CompletionDeliveryOutcome | void;
   onFailed?: (error: unknown) => CompletionDeliveryOutcome | void;
+  /**
+   * Return true when a failure leaves the work resumable on disk. History then
+   * stays `running` (not rewritten as terminal) so restart recovery claims it;
+   * `onFailed` still notifies. Default: every failure is terminal.
+   */
+  keepRunningOnFailure?: (error: unknown) => boolean;
   onSettled?: () => void;
   now?: () => number;
 }
@@ -151,7 +157,7 @@ export function startSdkBackgroundTask<TResult extends SdkBackgroundResult>(
       const status: TaskSessionHistoryEntry["status"] =
         kind === "timeout" ? "timeout" : kind === "cancelled" ? "cancelled" : "failed";
       try {
-        record(status, { completedAt: now() });
+        if (!input.keepRunningOnFailure?.(error)) record(status, { completedAt: now() });
       } catch (error) {
         reportDurableRecordFailure(error, "failure");
         // Best-effort durable record of the failure.

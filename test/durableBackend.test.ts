@@ -19,6 +19,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 
 import {
   abortDurableTask,
+  durableDatabasePath,
   durableRequestId,
   DurableTaskCancelledError,
   durableRetryFromSettings,
@@ -4421,6 +4422,171 @@ test("a real mid-session storage failure closes the harness, reports it, and the
     console.error = realConsoleError;
     try { blocker?.exec("ROLLBACK"); blocker?.close(); } catch { /* already closed */ }
     if (reopened) await reopened.harness.close(reopened.context);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A SessionFailed run says nothing about the task's outcome: the durable run is
+ * still `running` on disk and the next open resumes it. History must stay
+ * `running` so restart recovery claims and delivers it; any other failure is
+ * terminal on disk too and stays `failed`.
+ */
+async function runFailingDurableTask(
+  rootPrefix: string,
+  isBackground: boolean,
+  failure: (durable: typeof import("@earendil-works/pi-durable")) => Error,
+) {
+  const root = mkdtempSync(join(tmpdir(), rootPrefix));
+  const piDir = join(root, ".pi");
+  const sent: { details?: Record<string, unknown> }[] = [];
+  try {
+    const durable = await import("@earendil-works/pi-durable");
+    const result = await executeDurableTask({
+      id: "t-storage-failure",
+      agent: { name: "general", description: "General task", body: "", source: "project", path: "test-agent.md" },
+      description: "Fail the store",
+      sessionName: "task-t-storage-failure",
+      prompt: "Run.",
+      cwd: root,
+      toolCallId: "call-storage-failure",
+      ctx: { modelRegistry: {} } as never,
+      pi: { sendMessage: (message: { details?: Record<string, unknown> }) => { sent.push(message); } } as never,
+      piDir,
+      artifactsDir: join(piDir, "artifacts"),
+      isBackground,
+      backgroundTasks: new Map(),
+      foregroundTasks: new Map(),
+      deliveryGuard: new DeliveryGuard(),
+      taskWidget: { openTaskView() {}, closeTaskView() {}, noteTaskFinished() {}, setLiveTranscript() {} } as never,
+      clearTaskWidgetIfIdle: () => {},
+      ensureTaskWidget: () => {},
+      enqueueDelivery: (delivery) => delivery(),
+      runTask: async (input) => {
+        input.onSubmitted?.("storage-failure-child");
+        throw failure(durable);
+      },
+    });
+    for (let waited = 0; waited < 2_000 && isBackground && sent.length === 0; waited += 10) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return {
+      result,
+      sent,
+      status: readTaskSessionHistory(piDir).find((entry) => entry.id === "t-storage-failure")?.status,
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+for (const isBackground of [false, true]) {
+  const mode = isBackground ? "background" : "foreground";
+
+  test(`${mode} durable task: a storage failure keeps history running so restart recovers it`, async () => {
+    const { sent, status, result } = await runFailingDurableTask(
+      `pi-task-durable-storage-${mode}-`,
+      isBackground,
+      (durable) => new durable.SessionFailed(new Error("database is locked")),
+    );
+    assert.equal(status, "running", "history is not rewritten as failed");
+    const phase = isBackground ? sent[0]?.details?.phase : (result as { details: { phase?: string } }).details.phase;
+    assert.equal(phase, "failed", "the parent is still told this attempt failed");
+    const text = isBackground
+      ? String((sent[0] as { content?: string }).content)
+      : String((result as { content: { text: string }[] }).content[0]?.text);
+    assert.match(text, /resume/i, "the notice says the work is kept and resumes");
+  });
+
+  test(`${mode} durable task: an ordinary failure is still recorded as failed`, async () => {
+    const { status } = await runFailingDurableTask(
+      `pi-task-durable-ordinary-${mode}-`,
+      isBackground,
+      () => new Error("provider rejected the request"),
+    );
+    assert.equal(status, "failed");
+  });
+}
+
+test("a real storage failure mid-run does not orphan the run: restart recovery delivers it once", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-task-durable-storage-recover-"));
+  const piDir = join(root, ".pi");
+  const databasePath = durableDatabasePath(piDir);
+  const sent: { content?: string; details?: Record<string, unknown> }[] = [];
+  const pi = { sendMessage: (message: { content?: string; details?: Record<string, unknown> }) => { sent.push(message); } };
+  const realConsoleError = console.error;
+  console.error = () => {};
+  let blocker: import("node:sqlite").DatabaseSync | undefined;
+  try {
+    let modelCalls = 0;
+    const models = createModels();
+    const faux = fauxProvider();
+    models.setProvider(faux.provider);
+    faux.setResponses([
+      async () => { modelCalls += 1; await new Promise((resolve) => setTimeout(resolve, 800)); return fauxAssistantMessage("first"); },
+      async () => { modelCalls += 1; return fauxAssistantMessage("Recovered after the store failed."); },
+    ]);
+    const modelRegistry: DurableRuntimeModelRegistry = {
+      getAll: () => models.getAllModels() as never,
+      find: (provider, modelId) => models.getModel(provider, modelId),
+      streamSimple: (model, context, options) => models.streamSimple(model, context, options),
+    };
+    await executeDurableTask({
+      id: "t-storage-recover",
+      agent: { name: "general", description: "General task", body: "", source: "project", path: "test-agent.md" },
+      description: "Survive a store failure",
+      sessionName: "task-t-storage-recover",
+      prompt: "Run.",
+      cwd: root,
+      toolCallId: "call-storage-recover",
+      ctx: { modelRegistry } as never,
+      pi: pi as never,
+      piDir,
+      artifactsDir: join(piDir, "artifacts"),
+      isBackground: true,
+      backgroundTasks: new Map(),
+      foregroundTasks: new Map(),
+      deliveryGuard: new DeliveryGuard(),
+      taskWidget: { openTaskView() {}, closeTaskView() {}, noteTaskFinished() {}, setLiveTranscript() {} } as never,
+      clearTaskWidgetIfIdle: () => {},
+      ensureTaskWidget: () => {},
+      enqueueDelivery: (delivery) => delivery(),
+    });
+    for (let waited = 0; waited < 10_000 && modelCalls < 1; waited += 10) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(modelCalls, 1, "the run reached the model");
+
+    // The write lock makes the run's next commit fail with SQLITE_BUSY after 5s.
+    const { DatabaseSync } = await import("node:sqlite");
+    blocker = new DatabaseSync(databasePath);
+    blocker.exec("BEGIN EXCLUSIVE");
+    for (let waited = 0; waited < 15_000 && sent.length === 0; waited += 50) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    blocker.exec("ROLLBACK");
+    blocker.close();
+    blocker = undefined;
+    assert.equal(sent[0]?.details?.phase, "failed", "the parent is told the attempt failed");
+    assert.equal(
+      readTaskSessionHistory(piDir).find((entry) => entry.id === "t-storage-recover")?.status,
+      "running",
+      "history stays running so recovery can claim the run",
+    );
+
+    // Restart: recovery claims the still-running task and delivers it.
+    await resumeDurableAfterRestart({ pi: pi as never, piDir, databasePath, modelRegistry });
+    for (let waited = 0; waited < 10_000 && sent.length < 2; waited += 50) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(sent.length, 2, `failure notice plus exactly one recovery, got ${sent.length}`);
+    assert.match(sent[1]?.content ?? "", /resumed after restart and finished/);
+    assert.match(sent[1]?.content ?? "", /Recovered after the store failed/);
+  } finally {
+    console.error = realConsoleError;
+    try { blocker?.exec("ROLLBACK"); blocker?.close(); } catch { /* already closed */ }
+    const handle = await openDurableHarness(piDir, { databasePath }).catch(() => undefined);
+    if (handle) await handle.harness.close(handle.context);
     rmSync(root, { recursive: true, force: true });
   }
 });

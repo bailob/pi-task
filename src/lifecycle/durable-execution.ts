@@ -21,6 +21,7 @@ import {
   inspectDurableDatabasePath,
   DurableTaskCancelledError,
   inspectDurableTaskAdmission,
+  isDurableStorageFailure,
   parseDurableThinkingLevel,
   releaseUnadmittedDurableRun,
   resumeDurableTasks,
@@ -89,6 +90,16 @@ export interface DurableTaskExecutionOptions {
   ) => void;
   /** Runner injection for lifecycle tests; production uses runDurableTask. */
   runTask?: typeof runDurableTask;
+}
+
+/** Appended to a failure notice when the durable store, not the task, failed. */
+const STORAGE_FAILURE_NOTE =
+  "The durable store failed mid-run, so this says nothing about the task itself. " +
+  "The run is kept: it resumes when Pi next opens the store, and its result is delivered after a Pi restart.";
+
+function failureMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return isDurableStorageFailure(error) ? `${message}\n\n${STORAGE_FAILURE_NOTE}` : message;
 }
 
 export function formatDurableBackgroundReceipt(id: string): string {
@@ -721,12 +732,13 @@ export async function executeDurableTask({
           },
         );
       },
+      keepRunningOnFailure: isDurableStorageFailure,
       onFailed: (error) => {
         if (!deliveryGuard.allows(sessionViewOf(ctx), id)) return "suppressed";
         const cancelled = error instanceof DurableTaskCancelledError;
         const phase = cancelled ? "cancelled" as const : "failed" as const;
         backgroundTask.status = phase;
-        const message = error instanceof Error ? error.message : String(error);
+        const message = failureMessage(error);
         return notify(
           `Background task ${id} (${agent.name}) ${phase}.\n\n${message}`,
           {
@@ -840,12 +852,16 @@ export async function executeDurableTask({
   } catch (error) {
     const cancelled = error instanceof DurableTaskCancelledError;
     const phase = cancelled ? "cancelled" as const : "failed" as const;
-    const message = error instanceof Error ? error.message : String(error);
-    upsertTaskSessionHistory(piDir, {
-      ...historyBase,
-      status: phase,
-      completedAt: Date.now(),
-    });
+    const message = failureMessage(error);
+    // A storage failure leaves the run resumable on disk: keep history `running`
+    // so restart recovery claims it instead of orphaning a live run.
+    if (!isDurableStorageFailure(error)) {
+      upsertTaskSessionHistory(piDir, {
+        ...historyBase,
+        status: phase,
+        completedAt: Date.now(),
+      });
+    }
     foregroundTask.status = phase;
     foregroundTask.result = message;
     taskWidget.noteTaskFinished(id, foregroundTask, Date.now());

@@ -467,6 +467,19 @@ export function inspectDurableDatabasePath(
   }
 }
 
+/**
+ * True when `error` is pi-durable's `SessionFailed` (a storage error ended the
+ * Session), possibly wrapped. It says nothing about the task's outcome: the run
+ * is still `running` on disk and the next open resumes it.
+ */
+export function isDurableStorageFailure(error: unknown): boolean {
+  for (let depth = 0; depth < 5 && error instanceof Error; depth++) {
+    if (error.name === "SessionFailed") return true;
+    error = error.cause;
+  }
+  return false;
+}
+
 export class DurableTaskCancelledError extends Error {
   readonly kind = "cancelled" as const;
 
