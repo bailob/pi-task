@@ -4373,3 +4373,54 @@ test("bridged read-only tools run in the child's cwd, not the parent process cwd
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a real mid-session storage failure closes the harness, reports it, and the next open recovers", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-task-durable-storage-fail-"));
+  const piDir = join(root, ".pi");
+  const databasePath = join(root, "durable.sqlite");
+  const reports: string[] = [];
+  const realConsoleError = console.error;
+  console.error = (...args: unknown[]) => { reports.push(args.map(String).join(" ")); };
+  let reopened: Awaited<ReturnType<typeof openDurableHarness>> | undefined;
+  let blocker: import("node:sqlite").DatabaseSync | undefined;
+  try {
+    const first = await openDurableHarness(piDir, { databasePath });
+    await first.harness.root(first.context);
+
+    // A second connection holds the write lock, so the harness's next commit
+    // fails with SQLITE_BUSY once the 5s busy timeout expires.
+    const { DatabaseSync } = await import("node:sqlite");
+    blocker = new DatabaseSync(databasePath);
+    blocker.exec("BEGIN EXCLUSIVE");
+
+    const root1 = await first.harness.root(first.context);
+    await assert.rejects(
+      root1.commit(async (tx) => {
+        await tx.createConversation({ ownership: { kind: "ownerless" } });
+      }, first.context),
+    );
+    blocker.exec("ROLLBACK");
+    blocker.close();
+    blocker = undefined;
+
+    // Reopen immediately, before the failed harness finishes closing: the
+    // cache must already refuse the dead handle.
+    reopened = await openDurableHarness(piDir, { databasePath });
+    assert.notEqual(reopened, first, "the failed harness is not reused");
+    const end = await first.harness.closed;
+    assert.equal(end.reason, "failed", "a storage error ends the harness as failed");
+    assert.ok(
+      reports.some((line) => line.startsWith("[pi-task] durable harness report:")),
+      `onReport logs the storage failure, got: ${JSON.stringify(reports)}`,
+    );
+    const reopenedRoot = await reopened.harness.root(reopened.context);
+    await reopenedRoot.commit(async (tx) => {
+      await tx.createConversation({ ownership: { kind: "ownerless" } });
+    }, reopened.context);
+  } finally {
+    console.error = realConsoleError;
+    try { blocker?.exec("ROLLBACK"); blocker?.close(); } catch { /* already closed */ }
+    if (reopened) await reopened.harness.close(reopened.context);
+    rmSync(root, { recursive: true, force: true });
+  }
+});

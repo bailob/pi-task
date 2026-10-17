@@ -586,11 +586,17 @@ export async function openDurableHarness(
   harnessCache.set(databasePath, entry);
   // A rejected open or a closed Harness (a storage error closes it, and every
   // later call rejects with SessionFailed) is unusable: drop it so the next
-  // open reopens the storage instead of reusing the dead handle.
+  // open reopens the storage instead of reusing the dead handle. `subscribeClose`
+  // fires synchronously when the failure begins closing; `closed` only settles
+  // after in-flight work ends, so it alone leaves a window that hands out the
+  // dead handle.
   const evict = () => {
     if (harnessCache.get(databasePath) === entry) harnessCache.delete(databasePath);
   };
-  promise.then((handle) => handle.harness.closed.then(evict, evict), evict);
+  promise.then((handle) => {
+    handle.harness.subscribeClose(evict);
+    handle.harness.closed.then(evict, evict);
+  }, evict);
   return promise;
 }
 
