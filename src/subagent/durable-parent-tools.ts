@@ -35,15 +35,19 @@ export const BRIDGE_EXTENSION_NAME = "pi-task-parent-tools";
  *
  * - `signal` comes from the chord context (`context.abortSignal`), matching how
  *   pi-durable's own bash tool observes cancellation.
- * - cwd resolves per call from the invocation's execution environment, falling
- *   back to the conversation agent's cwd.
+ * - cwd: a tool given `forCwd` is rebuilt per call for the call environment's
+ *   cwd (`api.env.cwd`, the conversation agent's cwd); any other tool keeps the
+ *   cwd it was created with.
  * - `onUpdate` partial text streams through `api.output()`.
  * - `structuredContent` has no `ToolExecutionResult` representation and is
  *   folded into `details`; `terminate` maps to `control.terminate`.
  */
 export function adaptAgentTool(
 	tool: AgentTool<any, any>,
-	options: { replaySafe?: boolean } = {},
+	options: {
+		replaySafe?: boolean;
+		forCwd?: (cwd: string) => AgentTool<any, any>;
+	} = {},
 ): ToolRegistration {
 	const replaySafe = options.replaySafe ?? true;
 	const execute = async (
@@ -52,7 +56,9 @@ export function adaptAgentTool(
 		context: Context,
 	): Promise<ToolExecutionResult> => {
 		try {
-			const result = await tool.execute(
+			const callTool =
+				options.forCwd && api.env?.cwd ? options.forCwd(api.env.cwd) : tool;
+			const result = await callTool.execute(
 				api.callId,
 				args as never,
 				context.abortSignal,
@@ -176,22 +182,25 @@ export async function loadDurableParentToolBridge(): Promise<
 > {
 	try {
 		const sdk = await import("@earendil-works/pi-coding-agent");
-		const candidates: AgentTool<any, any>[] = [];
+		const candidates: {
+			tool: AgentTool<any, any>;
+			create: (cwd: string) => AgentTool<any, any>;
+		}[] = [];
 		for (const create of [
 			sdk.createGrepTool,
 			sdk.createFindTool,
 			sdk.createLsTool,
 		] as const) {
 			try {
-				candidates.push(create(process.cwd()));
+				candidates.push({ tool: create(process.cwd()), create });
 			} catch {
 				// A factory failing to construct drops that single tool, never the backend.
 			}
 		}
 		return {
 			name: BRIDGE_EXTENSION_NAME,
-			tools: candidates.map((tool) =>
-				adaptAgentTool(tool, { replaySafe: true }),
+			tools: candidates.map(({ tool, create }) =>
+				adaptAgentTool(tool, { replaySafe: true, forCwd: create }),
 			),
 		};
 	} catch {

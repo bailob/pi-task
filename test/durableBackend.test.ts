@@ -4338,3 +4338,27 @@ test("a closed harness is evicted from the cache: the next open returns a workin
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("bridged read-only tools run in the child's cwd, not the parent process cwd", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-task-durable-bridge-cwd-"));
+  const piDir = join(root, ".pi");
+  const databasePath = join(root, "durable.sqlite");
+  const childDir = join(root, "child-worktree");
+  mkdirSync(childDir);
+  writeFileSync(join(childDir, "cwd-marker-file.txt"), "marker");
+  let handle: Awaited<ReturnType<typeof openDurableHarness>> | undefined;
+  try {
+    handle = await openDurableHarness(piDir, { databasePath });
+    const ls = handle.toolRegistrations.find((tool) => tool.name === "ls");
+    assert.ok(ls, "the bridge installs ls");
+    const result = await ls.execute(
+      {} as never,
+      { callId: "call-bridge-cwd", env: { cwd: childDir }, output: () => undefined } as never,
+      handle.context,
+    );
+    assert.match(JSON.stringify(result.output), /cwd-marker-file\.txt/);
+  } finally {
+    if (handle) await handle.harness.close(handle.context);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
