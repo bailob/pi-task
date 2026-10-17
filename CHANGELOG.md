@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.10] - 2026-10-17
+
 ### Fixed
 
 - The durable backend reopens its harness after a failed open or a closed
