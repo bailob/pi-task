@@ -333,7 +333,11 @@ test("comparison partial markers wait until Pi persists the partial report", asy
       undefined,
       () => { partialMarkers += 1; },
     );
-    await sleep(20);
+    // The partial report goes out after the join window and a queue flush; wait
+    // for it instead of guessing a delay (a fixed 20ms failed under CPU load).
+    for (let waited = 0; waited < 2_000 && sentMessages.length === 0; waited += 5) {
+      await sleep(5);
+    }
     assert.equal(sentMessages.length, 1);
     assert.equal(queue.hasPending(), true);
     assert.equal(partialMarkers, 0, "partial history is not marked before native persistence");
