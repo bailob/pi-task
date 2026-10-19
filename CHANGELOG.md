@@ -6,6 +6,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Experimental in-session agent messaging (`PI_TASK_AGENT_MESSAGING=1` or
+  `"taskAgentMessaging": true`). The main agent and its durable subagents get an
+  `agents` tool to list each other, send a message, and read an agent's last
+  message. Messages to running subagents are steered into their run and
+  messages to the main agent start a follow-up turn; no message starts a
+  subagent run. A subagent cannot message a sibling with tools or a working
+  directory it lacks, subagent messages share a per-session budget that resets
+  on user input, and a message cannot imitate pi-task's message framing.
+- Experimental cross-session messaging (`PI_TASK_SESSION_MESSAGING=1` or
+  `"taskSessionMessaging": true`, separate from in-session messaging). Main
+  agents of interactive and RPC Pi sessions of one user list each other and
+  send or read through `agents` with `session:<id>` targets, over a private
+  file mesh under `~/.pi/agent/pi-task/mesh/`. Delivery is best effort and at
+  most once; senders and receivers each cap turns per user input.
+
+### Changed
+
+- Durable tasks run in one store per Pi session,
+  `.pi/durable/sessions/<session>.sqlite`, recorded on each task's history
+  row. Concurrent Pi sessions in one project can now all run durable tasks.
+  Steer, abort, child commands, history browsing, and restart recovery open the
+  store recorded for the task. A task resumed by `task_id` from another session
+  stays in the store that holds its child. Tasks started before this change
+  keep using the legacy project store, `.pi/durable/tasks.sqlite`.
+
+### Fixed
+
+- One Pi process owns a durable store at a time. pi-durable has no
+  cross-process locking, so a second Pi session in the same project that
+  opened the shared store resumed and re-answered durable work another live
+  process was still running. A store is now locked before it is opened, and
+  its owner keeps it until it exits. A durable task whose store another live
+  process owns is refused before any receipt or history row, with a message
+  naming that process. At startup a session opens only the stores holding its
+  own running durable work.
+
 ## [0.11.10] - 2026-10-17
 
 ### Fixed

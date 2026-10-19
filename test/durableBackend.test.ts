@@ -2966,6 +2966,19 @@ test("durable restart recovery does not treat an unstatable database as missing"
   try {
     mkdirSync(piDir, { recursive: true });
     writeFileSync(storagePath, "not a directory");
+    // Only a store holding this session's running work is consulted.
+    upsertTaskSessionHistory(piDir, {
+      id: "t-unstatable",
+      status: "running",
+      background: true,
+      backend: "durable",
+      agentType: "general",
+      description: "Needs an unstatable store",
+      sessionName: "task-t-unstatable",
+      startedAt: Date.now(),
+      piDir,
+      dir: join(piDir, "artifacts"),
+    });
 
     await assert.rejects(
       resumeDurableAfterRestart({

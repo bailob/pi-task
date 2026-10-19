@@ -16,8 +16,9 @@ import {
   type DurableModelsFactory,
   type DurableRuntimeModelRegistry,
   type DurableUsage,
-  durableDatabasePath,
   durableRequestId,
+  durableSessionStore,
+  resolveDurableStorePath,
   inspectDurableDatabasePath,
   DurableTaskCancelledError,
   inspectDurableTaskAdmission,
@@ -27,6 +28,10 @@ import {
   resumeDurableTasks,
   runDurableTask,
 } from "../subagent/durable.js";
+import {
+  acquireDurableStoreLock,
+  isDurableStoreLockedError,
+} from "../subagent/durable-store-lock.js";
 import { gptConfigFastEnabled } from "../fast-mode.js";
 import {
   failUnadmittedTaskSessionHistory,
@@ -111,6 +116,15 @@ export function formatDurableBackgroundReceipt(id: string): string {
 }
 
 /**
+ * A history row whose child may live in a durable store: a durable row, or a
+ * legacy row from before `backend` was recorded that has no pane or handle.
+ */
+function mayHaveDurableChild(history: TaskSessionHistoryEntry): boolean {
+  return history.backend === "durable" ||
+    (history.backend === undefined && !history.paneId && !history.handle);
+}
+
+/**
  * Finish submissions a previous process left running on this repo's durable
  * storage and deliver their results: recovered answers become task-complete
  * messages (guarded by session ownership), failures become failure messages.
@@ -123,6 +137,12 @@ export async function resumeDurableAfterRestart(deps: {
   sessionId?: string;
   /** Test seams, mirroring the controller's open options. */
   databasePath?: string;
+  /**
+   * Report a store that could not be resumed (unreadable, owned by another
+   * live process) while the others still resume. Without it, the first such
+   * failure is rethrown after every store was tried.
+   */
+  onStoreFailure?: (databasePath: string, error: unknown) => void;
   models?: DurableModelsFactory;
   modelRegistry?: DurableRuntimeModelRegistry;
   /** Restore the non-focusing task row before attaching its live transcript. */
@@ -157,10 +177,20 @@ export async function resumeDurableAfterRestart(deps: {
 }): Promise<ReadonlySet<string>> {
   const { pi, piDir, sessionId } = deps;
   const durableTaskIds = new Set<string>();
-  const databasePath = deps.databasePath ?? durableDatabasePath(piDir);
-  const storage = inspectDurableDatabasePath(databasePath);
-  if (storage.kind === "missing") return durableTaskIds;
-  if (storage.kind === "unreadable") throw storage.error;
+  // Opening a store claims it for this process (one owner per store), so only
+  // the stores holding this session's own running work are opened; any other
+  // session's store is left to that session. Unattributed work in an opened
+  // store is still resumed by its open.
+  const ownRunning = readTaskSessionHistory(piDir).filter((history) =>
+    history.status === "running" &&
+    mayHaveDurableChild(history) &&
+    (history.ownerSessionId === undefined || history.ownerSessionId === sessionId)
+  );
+  if (ownRunning.length === 0) return durableTaskIds;
+  // Recorded stores are resolved inside the loop, so one bad path fails only its store.
+  const recordedStores = deps.databasePath !== undefined
+    ? [undefined]
+    : [...new Set(ownRunning.map((history) => history.durableStore))];
   const notify = (
     deliveryId: string,
     content: string,
@@ -188,216 +218,230 @@ export async function resumeDurableAfterRestart(deps: {
   const resumedTranscripts = new Map<string, DurableTranscript>();
   const resumedHistory = new Map<string, TaskSessionHistoryEntry | undefined>();
   const authorizedTasks = new Set<string>();
-  await resumeDurableTasks(
-    piDir,
-    {
-      shouldRecover: (taskId, requestId) => {
-        const history = owned(taskId);
-        if (history === "other-session") return false;
-        if (!history) return true;
-        return history.status === "running" &&
-          (history.durableRequestId === undefined || history.durableRequestId === requestId);
-      },
-      requestIdForTask: (taskId) => {
-        const history = owned(taskId);
-        return history && history !== "other-session"
-          ? history.durableRequestId
-          : undefined;
-      },
-      onActive: (taskId, conversationId) => {
-        durableTaskIds.add(taskId);
-        const history = owned(taskId);
-        if (history === "other-session") return false;
-        const durableHistory = history && history.backend !== "durable"
-          ? { ...history, backend: "durable" as const }
-          : history;
-        if (durableHistory && durableHistory !== history) {
-          try {
-            upsertTaskSessionHistory(piDir, durableHistory);
-          } catch {
-            // In-memory discovery still protects this task from stale-SDK reconciliation.
-          }
-        }
-        resumedHistory.set(taskId, durableHistory);
-        authorizedTasks.add(taskId);
-        try {
-          deps.onTaskResumed?.(taskId, durableHistory, conversationId);
-        } catch {
-          // A UI restore failure must not prevent the durable submission resuming.
-        }
-        return true;
-      },
-      onSnapshot: (taskId, snapshot) => {
-        const transcript = new DurableTranscript(snapshot);
-        resumedTranscripts.set(taskId, transcript);
-        deps.onTaskProgress?.(
-          taskId,
-          transcript.items(),
-          transcript.toolCallCount(),
-          transcript.agentState(),
-          transcript.usageMetadata(),
-        );
-      },
-      onEvents: (taskId, events) => {
-        const transcript = resumedTranscripts.get(taskId);
-        if (!transcript) return;
-        deps.onTaskProgress?.(
-          taskId,
-          transcript.apply(events),
-          transcript.toolCallCount(),
-          transcript.agentState(),
-          transcript.usageMetadata(),
-        );
-      },
-      onWatchError: (taskId, error) => {
-        if (!authorizedTasks.has(taskId)) return;
-        const transcript = resumedTranscripts.get(taskId);
-        deps.onTaskWatchError?.(
-          taskId,
-          transcript?.items() ?? [],
-          transcript?.toolCallCount() ?? 0,
-          error,
-        );
-      },
-      onSettled: (taskId, status) => {
-        if (!authorizedTasks.delete(taskId)) return;
-        const history = resumedHistory.get(taskId);
-        resumedHistory.delete(taskId);
-        resumedTranscripts.delete(taskId);
-        try {
-          deps.onTaskSettled?.(taskId, history, status);
-        } catch {
-          // A UI cleanup failure must not alter the recovered result.
-        }
-      },
-      onRecovered: (taskId, output, usage) => {
-        const history = owned(taskId);
-        if (history === "other-session" || (history && history.status !== "running")) return;
-        const parsed = parseResultXml(output);
-        const assessment = assessTaskResult(parsed);
-        if (history) {
-          try {
-            upsertTaskSessionHistory(piDir, {
-              ...history,
-              status: "done",
-              reportedStatus: assessment.reportedStatus,
-              rawStatus: assessment.rawStatus,
-              resultValid: assessment.valid,
-              completedAt: Date.now(),
-            });
-          } catch {
-            // History is best-effort; delivery below still runs.
-          }
-        }
-        const summary = taskResultContentText(parsed, assessment) || output.trim();
-        notify(
-          completionDeliveryId(taskId, history?.startedAt ?? Date.now()),
-          `Background task ${taskId} (durable) resumed after restart and finished.\n\n${summary}`,
-          {
-            usage,
-            agent_type: history?.agentType ?? "task",
-            description: history?.description ?? "",
-            phase: "done",
-            execution_phase: "done",
-            status: assessment.reportedStatus,
-            reported_status: assessment.reportedStatus,
-            raw_status: assessment.rawStatus,
-            result_valid: assessment.valid,
-            result: output,
-            summary: parsed.summary,
-            findings: parsed.findings,
-            evidence: parsed.evidence,
-            files: parsed.files,
-            caveats: parsed.caveats,
-            next_steps: parsed.next_steps,
-            background: true,
-            backend: "durable",
-            task_id: taskId,
-            resumed: true,
-            structured_result: structuredResultPayload(assessment),
-            full_output: parsed.raw.trim() || output.trim(),
-          },
-        );
-      },
-      onCancelled: (taskId, reason, usage) => {
-        const history = owned(taskId);
-        if (history === "other-session" || (history && history.status !== "running")) return;
-        if (history) {
-          try {
-            upsertTaskSessionHistory(piDir, {
-              ...history,
-              status: "cancelled",
-              completedAt: Date.now(),
-            });
-          } catch {
-            // History is best-effort.
-          }
-        }
-        notify(
-          completionDeliveryId(taskId, history?.startedAt ?? Date.now()),
-          `Background task ${taskId} (durable) was cancelled.\n\n${reason}`,
-          {
-            agent_type: history?.agentType ?? "task",
-            description: history?.description ?? "",
-            phase: "cancelled",
-            execution_phase: "cancelled",
-            status: "unknown",
-            reported_status: "unknown",
-            result_valid: false,
-            background: true,
-            backend: "durable",
-            task_id: taskId,
-            resumed: true,
-            error: reason,
-            ...(usage ? { usage } : {}),
-          },
-        );
-      },
-      onFailed: (taskId, reason, usage) => {
-        const history = owned(taskId);
-        if (history === "other-session" || (history && history.status !== "running")) return;
-        if (history) {
-          try {
-            upsertTaskSessionHistory(piDir, {
-              ...history,
-              status: "failed",
-              completedAt: Date.now(),
-            });
-          } catch {
-            // History is best-effort.
-          }
-        }
-        notify(
-          completionDeliveryId(taskId, history?.startedAt ?? Date.now()),
-          `Background task ${taskId} (durable) did not survive the restart.\n\n${reason}`,
-          {
-            agent_type: history?.agentType ?? "task",
-            description: history?.description ?? "",
-            phase: "failed",
-            status: "unknown",
-            result_valid: false,
-            background: true,
-            backend: "durable",
-            task_id: taskId,
-            resumed: true,
-            error: reason,
-            ...(usage ? { usage } : {}),
-          },
-        );
-      },
+  const hooks: Parameters<typeof resumeDurableTasks>[1] = {
+    shouldRecover: (taskId, requestId) => {
+      const history = owned(taskId);
+      if (history === "other-session") return false;
+      if (!history) return true;
+      return history.status === "running" &&
+        (history.durableRequestId === undefined || history.durableRequestId === requestId);
     },
-    {
-      databasePath: deps.databasePath,
-      models: deps.models,
-      modelRegistry: deps.modelRegistry,
-      fast: (typeof deps.pi.getFlag === "function" && deps.pi.getFlag("fast") === true) ||
-        gptConfigFastEnabled(
-          typeof deps.pi.getSettings === "function"
-            ? (deps.pi.getSettings() as Record<string, unknown> | undefined)
-            : undefined,
-        ),
+    requestIdForTask: (taskId) => {
+      const history = owned(taskId);
+      return history && history !== "other-session"
+        ? history.durableRequestId
+        : undefined;
     },
-  );
+    onActive: (taskId, conversationId) => {
+      durableTaskIds.add(taskId);
+      const history = owned(taskId);
+      if (history === "other-session") return false;
+      const durableHistory = history && history.backend !== "durable"
+        ? { ...history, backend: "durable" as const }
+        : history;
+      if (durableHistory && durableHistory !== history) {
+        try {
+          upsertTaskSessionHistory(piDir, durableHistory);
+        } catch {
+          // In-memory discovery still protects this task from stale-SDK reconciliation.
+        }
+      }
+      resumedHistory.set(taskId, durableHistory);
+      authorizedTasks.add(taskId);
+      try {
+        deps.onTaskResumed?.(taskId, durableHistory, conversationId);
+      } catch {
+        // A UI restore failure must not prevent the durable submission resuming.
+      }
+      return true;
+    },
+    onSnapshot: (taskId, snapshot) => {
+      const transcript = new DurableTranscript(snapshot);
+      resumedTranscripts.set(taskId, transcript);
+      deps.onTaskProgress?.(
+        taskId,
+        transcript.items(),
+        transcript.toolCallCount(),
+        transcript.agentState(),
+        transcript.usageMetadata(),
+      );
+    },
+    onEvents: (taskId, events) => {
+      const transcript = resumedTranscripts.get(taskId);
+      if (!transcript) return;
+      deps.onTaskProgress?.(
+        taskId,
+        transcript.apply(events),
+        transcript.toolCallCount(),
+        transcript.agentState(),
+        transcript.usageMetadata(),
+      );
+    },
+    onWatchError: (taskId, error) => {
+      if (!authorizedTasks.has(taskId)) return;
+      const transcript = resumedTranscripts.get(taskId);
+      deps.onTaskWatchError?.(
+        taskId,
+        transcript?.items() ?? [],
+        transcript?.toolCallCount() ?? 0,
+        error,
+      );
+    },
+    onSettled: (taskId, status) => {
+      if (!authorizedTasks.delete(taskId)) return;
+      const history = resumedHistory.get(taskId);
+      resumedHistory.delete(taskId);
+      resumedTranscripts.delete(taskId);
+      try {
+        deps.onTaskSettled?.(taskId, history, status);
+      } catch {
+        // A UI cleanup failure must not alter the recovered result.
+      }
+    },
+    onRecovered: (taskId, output, usage) => {
+      const history = owned(taskId);
+      if (history === "other-session" || (history && history.status !== "running")) return;
+      const parsed = parseResultXml(output);
+      const assessment = assessTaskResult(parsed);
+      if (history) {
+        try {
+          upsertTaskSessionHistory(piDir, {
+            ...history,
+            status: "done",
+            reportedStatus: assessment.reportedStatus,
+            rawStatus: assessment.rawStatus,
+            resultValid: assessment.valid,
+            completedAt: Date.now(),
+          });
+        } catch {
+          // History is best-effort; delivery below still runs.
+        }
+      }
+      const summary = taskResultContentText(parsed, assessment) || output.trim();
+      notify(
+        completionDeliveryId(taskId, history?.startedAt ?? Date.now()),
+        `Background task ${taskId} (durable) resumed after restart and finished.\n\n${summary}`,
+        {
+          usage,
+          agent_type: history?.agentType ?? "task",
+          description: history?.description ?? "",
+          phase: "done",
+          execution_phase: "done",
+          status: assessment.reportedStatus,
+          reported_status: assessment.reportedStatus,
+          raw_status: assessment.rawStatus,
+          result_valid: assessment.valid,
+          result: output,
+          summary: parsed.summary,
+          findings: parsed.findings,
+          evidence: parsed.evidence,
+          files: parsed.files,
+          caveats: parsed.caveats,
+          next_steps: parsed.next_steps,
+          background: true,
+          backend: "durable",
+          task_id: taskId,
+          resumed: true,
+          structured_result: structuredResultPayload(assessment),
+          full_output: parsed.raw.trim() || output.trim(),
+        },
+      );
+    },
+    onCancelled: (taskId, reason, usage) => {
+      const history = owned(taskId);
+      if (history === "other-session" || (history && history.status !== "running")) return;
+      if (history) {
+        try {
+          upsertTaskSessionHistory(piDir, {
+            ...history,
+            status: "cancelled",
+            completedAt: Date.now(),
+          });
+        } catch {
+          // History is best-effort.
+        }
+      }
+      notify(
+        completionDeliveryId(taskId, history?.startedAt ?? Date.now()),
+        `Background task ${taskId} (durable) was cancelled.\n\n${reason}`,
+        {
+          agent_type: history?.agentType ?? "task",
+          description: history?.description ?? "",
+          phase: "cancelled",
+          execution_phase: "cancelled",
+          status: "unknown",
+          reported_status: "unknown",
+          result_valid: false,
+          background: true,
+          backend: "durable",
+          task_id: taskId,
+          resumed: true,
+          error: reason,
+          ...(usage ? { usage } : {}),
+        },
+      );
+    },
+    onFailed: (taskId, reason, usage) => {
+      const history = owned(taskId);
+      if (history === "other-session" || (history && history.status !== "running")) return;
+      if (history) {
+        try {
+          upsertTaskSessionHistory(piDir, {
+            ...history,
+            status: "failed",
+            completedAt: Date.now(),
+          });
+        } catch {
+          // History is best-effort.
+        }
+      }
+      notify(
+        completionDeliveryId(taskId, history?.startedAt ?? Date.now()),
+        `Background task ${taskId} (durable) did not survive the restart.\n\n${reason}`,
+        {
+          agent_type: history?.agentType ?? "task",
+          description: history?.description ?? "",
+          phase: "failed",
+          status: "unknown",
+          result_valid: false,
+          background: true,
+          backend: "durable",
+          task_id: taskId,
+          resumed: true,
+          error: reason,
+          ...(usage ? { usage } : {}),
+        },
+      );
+    },
+  };
+  const fast = (typeof deps.pi.getFlag === "function" && deps.pi.getFlag("fast") === true) ||
+    gptConfigFastEnabled(
+      typeof deps.pi.getSettings === "function"
+        ? (deps.pi.getSettings() as Record<string, unknown> | undefined)
+        : undefined,
+    );
+  // One store's failure (unreadable, owned by a live process) must not keep
+  // the others from resuming; the first failure is reported afterwards.
+  let firstFailure: { error: unknown } | undefined;
+  for (const durableStore of recordedStores) {
+    let databasePath = "";
+    try {
+      databasePath = deps.databasePath ?? resolveDurableStorePath(piDir, durableStore);
+      const storage = inspectDurableDatabasePath(databasePath);
+      if (storage.kind === "missing") continue;
+      if (storage.kind === "unreadable") throw storage.error;
+      await resumeDurableTasks(piDir, hooks, {
+        databasePath,
+        models: deps.models,
+        modelRegistry: deps.modelRegistry,
+        fast,
+      });
+    } catch (error) {
+      if (deps.onStoreFailure) deps.onStoreFailure(databasePath, error);
+      else firstFailure ??= { error };
+    }
+  }
+  if (firstFailure) throw firstFailure.error;
   return durableTaskIds;
 }
 
@@ -511,6 +555,37 @@ export async function executeDurableTask({
   enqueueDelivery,
   runTask: runTaskOverride,
 }: DurableTaskExecutionOptions) {
+  const owner = durableParentOf(sessionViewOf(ctx));
+  // A resumed task stays in the store that holds its child (absent: legacy);
+  // a new task goes to this session's own store.
+  const existingHistory = findTaskSessionHistory(piDir, id);
+  const durableStore = existingHistory?.durableStore ??
+    (existingHistory && mayHaveDurableChild(existingHistory)
+      ? undefined
+      : durableSessionStore(owner.ownerSessionId));
+  const databasePath = resolveDurableStorePath(piDir, durableStore);
+  // Refuse before any receipt or history row: another live process owns the
+  // store, so this run could neither start nor be resumed from here.
+  try {
+    (await acquireDurableStoreLock(databasePath))();
+  } catch (error) {
+    if (!isDurableStoreLockedError(error)) throw error;
+    return {
+      content: [{ type: "text" as const, text: `Durable task not started: ${error.message}` }],
+      details: {
+        task_id: id,
+        background: isBackground,
+        phase: "failed" as const,
+        execution_phase: "failed" as const,
+        status: "unknown",
+        reported_status: "unknown",
+        result_valid: false,
+        backend: "durable" as const,
+        error: error.message,
+      },
+      isError: true,
+    };
+  }
   const startedAt = Date.now();
   const runnerAbortController = new AbortController();
   const forwardForegroundAbort = () => runnerAbortController.abort();
@@ -518,7 +593,6 @@ export async function executeDurableTask({
   const sessionModel = ctx.model
     ? { provider: ctx.model.provider, modelId: ctx.model.id }
     : undefined;
-  const owner = durableParentOf(sessionViewOf(ctx));
   const requestId = durableRequestId(id, toolCallId);
   const notify = (
     content: string,
@@ -573,6 +647,7 @@ export async function executeDurableTask({
     background: isBackground,
     backend: "durable" as const,
     durableRequestId: requestId,
+    ...(durableStore !== undefined ? { durableStore } : {}),
     ...owner,
     ownerPid: process.pid,
   };
@@ -600,6 +675,7 @@ export async function executeDurableTask({
       taskId: id,
       task: prompt,
       requestId,
+      databasePath,
       cwd,
       model,
       sessionModel,
@@ -689,6 +765,7 @@ export async function executeDurableTask({
       artifactsDir,
       backend: "durable",
       durableRequestId: requestId,
+      ...(durableStore !== undefined ? { durableStore } : {}),
       cwd,
       conversationId,
       ...owner,

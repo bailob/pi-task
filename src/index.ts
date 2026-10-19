@@ -19,7 +19,7 @@ import { randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { buildAgentToolSelection } from "./agent-tools.js";
 import {
@@ -130,12 +130,36 @@ import {
   abortDurableTask,
   executeDurableChildBuiltinCommand,
   readDurableTaskHistoryTranscript,
+  createDurableMessagingAccess,
   retrySettingsSourceFrom,
   setDurableRetrySettingsSource,
   steerDurableTask,
   type DurableRuntimeModelRegistry,
 } from "./subagent/durable.js";
-import { ignoreStaleExtensionCtx } from "./stale-ctx.js";
+import { ignoreStaleExtensionCtx, isStaleExtensionCtxError } from "./stale-ctx.js";
+import { errorMessageOf } from "./model-failover.js";
+import {
+  SESSION_MESSAGE_CUSTOM_TYPE,
+  createSessionMeshAccess,
+  isAddressableSessionId,
+  meshRoot,
+  sessionMessagingEnabled,
+  startParticipant,
+  type Participant,
+} from "./session-mesh.js";
+import {
+  AGENT_MESSAGE_CUSTOM_TYPE,
+  AGENTS_TOOL_NAME,
+  agentMessagingEnabled,
+  agentsParametersSchema,
+  agentsToolDescription,
+  createAgentMessagingService,
+  getAgentMessagingService,
+  lastAssistantOnBranch,
+  sessionsToolDescription,
+  setAgentMessagingService,
+  type AgentsParams,
+} from "./agent-messaging.js";
 import { resolveTaskCwd } from "./task-cwd.js";
 import { serializeTaskAdmission } from "./task-admission.js";
 import { handleTaskControl } from "./task-control-api.js";
@@ -346,12 +370,196 @@ export default function (pi: ExtensionAPI) {
     deliveryGuard,
   });
 
+  // ── Agent messaging (opt-in: in-session and cross-session) ─────────────
+  // Pi's settings are readable only once the session is bound, so the opt-in
+  // is decided on session_start (before durable restore, so resumed children
+  // find the service) and the `agents` tool is registered then. Pi can emit
+  // session_start again for the same session (a rebind); that reuses the setup.
+  let messaging: ReturnType<typeof createAgentMessagingService> | undefined;
+  // The latest main-session ctx; a stale one (after a session replacement)
+  // reads as "no session" instead of failing the calling agent.
+  let messagingCtx: ExtensionContext | undefined;
+  const withMessagingCtx = <T>(read: (ctx: ExtensionContext) => T): T | undefined => {
+    if (!messagingCtx) return undefined;
+    try {
+      return read(messagingCtx);
+    } catch (error) {
+      if (isStaleExtensionCtxError(error)) return undefined;
+      throw error;
+    }
+  };
+  // Cross-session messaging (separate opt-in): this instance's endpoint in
+  // the per-user session mesh, only for interactive and RPC sessions — a
+  // `pi -p` run would receive messages and exit with them.
+  let participant: Participant | undefined;
+  let messagingInSession = false;
+  // Pi's TUI draws over raw stderr, so warnings that can happen while it runs
+  // go through the UI; stderr is for print and JSON runs only.
+  const warnUser = (ctx: ExtensionContext, text: string) => {
+    if (ctx.hasUI) ctx.ui.notify(text, "warning");
+    else console.error(text);
+  };
+  // Mesh warnings can be triggered from outside (any process of this user can
+  // write an inbox file) or repeat every heartbeat; each distinct one shows once.
+  const meshWarnings = new Set<string>();
+  const setupAgentMessaging = (ctx: ExtensionContext) => {
+    messagingCtx = ctx;
+    if (messaging) {
+      if (messagingInSession) setAgentMessagingService(messaging);
+      return;
+    }
+    let settings: Record<string, unknown> | undefined;
+    try {
+      settings = typeof pi.getSettings === "function"
+        ? (pi.getSettings() as Record<string, unknown> | undefined)
+        : undefined;
+    } catch {
+      settings = undefined;
+    }
+    const inSession = agentMessagingEnabled(settings);
+    const crossSession = sessionMessagingEnabled(settings) && (ctx.mode === "tui" || ctx.mode === "rpc");
+    if (!inSession) setAgentMessagingService(undefined);
+    if (!inSession && !crossSession) return;
+    const currentSessionId = () =>
+      withMessagingCtx((current) => current.sessionManager.getSessionId()) || undefined;
+    const root = meshRoot(getAgentDir());
+    const meshSessionId = currentSessionId();
+    if (crossSession && isAddressableSessionId(meshSessionId)) {
+      try {
+        participant = startParticipant({
+          root,
+          sessionId: meshSessionId,
+          cwd: ctx.cwd,
+          sessionName: ctx.sessionManager.getSessionName(),
+          isActive: () => currentSessionId() === meshSessionId,
+          deliver: (content, messages, triggerTurn) =>
+            pi.sendMessage(
+              {
+                customType: SESSION_MESSAGE_CUSTOM_TYPE,
+                content,
+                display: true,
+                details: { from: messages.map((message) => message.from) },
+              },
+              { deliverAs: "followUp", triggerTurn },
+            ),
+          onError: (error) => {
+            const text = `[pi-task] session mesh: ${errorMessageOf(error)}`;
+            if (meshWarnings.has(text)) return;
+            meshWarnings.add(text);
+            withMessagingCtx((current) => warnUser(current, text));
+          },
+        });
+        const last = lastAssistantOnBranch(ctx.sessionManager.getBranch());
+        participant.setLastAssistant(last?.text, last?.at);
+      } catch (error) {
+        participant = undefined;
+        warnUser(ctx, `[pi-task] session mesh unavailable: ${errorMessageOf(error)}`);
+      }
+    }
+    const service = createAgentMessagingService({
+      piDir: extensionPiDir,
+      currentSessionId,
+      inSession,
+      ...(crossSession
+        ? {
+            sessions: createSessionMeshAccess({
+              root,
+              self: () => participant,
+              cwd: () => ctx.cwd,
+              sessionName: () => withMessagingCtx((current) => current.sessionManager.getSessionName()),
+            }),
+          }
+        : {}),
+      ...createDurableMessagingAccess({
+        piDir: extensionPiDir,
+        sessionId: currentSessionId,
+        modelRegistry: () => runtimeModelRegistry,
+      }),
+      readMainLast: () =>
+        withMessagingCtx((current) => lastAssistantOnBranch(current.sessionManager.getBranch())?.text),
+      sendToMain: (content, details, fromTaskId) => {
+        const allowed = withMessagingCtx((current) => deliveryGuard.allows(sessionViewOf(current), fromTaskId));
+        if (!allowed) return "suppressed";
+        try {
+          pi.sendMessage(
+            { customType: AGENT_MESSAGE_CUSTOM_TYPE, content, display: true, details },
+            { deliverAs: "followUp", triggerTurn: true },
+          );
+          return "sent";
+        } catch (error) {
+          if (isStaleExtensionCtxError(error)) return "suppressed";
+          throw error;
+        }
+      },
+    });
+    pi.registerTool({
+      name: AGENTS_TOOL_NAME,
+      label: AGENTS_TOOL_NAME,
+      description: inSession
+        ? `${agentsToolDescription}${crossSession ? ` ${sessionsToolDescription}` : ""}`
+        : `List other Pi sessions of this user, send their main agent a message, or read its last answer. ${sessionsToolDescription}`,
+      promptSnippet: inSession
+        ? `List, message, and read the other agents of this session${crossSession ? " and other Pi sessions" : ""}`
+        : "List, message, and read other Pi sessions",
+      parameters: agentsParametersSchema(),
+      async execute(_toolCallId, params, _signal, _onUpdate, toolCtx) {
+        messagingCtx = toolCtx;
+        const outcome = await service.handle({ kind: "main" }, params as AgentsParams);
+        return {
+          content: [{ type: "text" as const, text: outcome.text }],
+          details: {},
+          ...(outcome.isError ? { isError: true } : {}),
+        };
+      },
+    });
+    messaging = service;
+    messagingInSession = inSession;
+    if (inSession) setAgentMessagingService(service);
+  };
+  pi.on("session_shutdown", (event, ctx) => {
+    // A reloaded or replaced extension instance must not keep serving children.
+    if (messaging && getAgentMessagingService() === messaging) setAgentMessagingService(undefined);
+    if (!participant) return;
+    // /reload, or resuming the very same session, brings this endpoint back,
+    // so its queued messages stay.
+    let sameSession = false;
+    ignoreStaleExtensionCtx(() => {
+      const file = ctx.sessionManager.getSessionFile();
+      sameSession = file !== undefined && event.targetSessionFile === file;
+    });
+    participant.stop({ keepInbox: event.reason === "reload" || sameSession });
+    participant = undefined;
+  });
+  pi.on("input", (event) => {
+    // Agent and session messages arrive as extension messages; only a person resets the budgets.
+    if (event.source === "extension") return;
+    messaging?.resetBudget();
+    participant?.resetIncoming();
+  });
+  const publishLastAssistant = (ctx: ExtensionContext) => {
+    if (!participant) return;
+    ignoreStaleExtensionCtx(() => {
+      const last = lastAssistantOnBranch(ctx.sessionManager.getBranch());
+      participant?.setLastAssistant(last?.text, last?.at);
+    });
+  };
+  pi.on("agent_end", (_event, ctx) => publishLastAssistant(ctx));
+  pi.on("session_tree", (_event, ctx) => publishLastAssistant(ctx));
+  pi.on("session_info_changed", (event) => participant?.setSessionName(event.name));
+
   // Durable-task restore and comparison replay wait for the first
   // session_start (issue #20): the owning session id only exists once a
   // session context does, and restore decisions depend on it. Until then the
   // maps stay empty; polling picks restored tasks up on its next tick.
   let restoredLifecycleOnce = false;
   pi.on("session_start", async (_event, ctx) => {
+    try {
+      ignoreStaleExtensionCtx(() => setupAgentMessaging(ctx));
+    } catch (error) {
+      // Messaging is optional; its failure must not skip durable restore.
+      ignoreStaleExtensionCtx(() =>
+        warnUser(ctx, `[pi-task] agent messaging setup failed: ${errorMessageOf(error)}`));
+    }
     completionDeliveryQueue.setPersistedDeliveryIdsReader((pendingDeliveryIds) =>
       persistedCompletionDeliveryIds(
         ctx.sessionManager.getSessionFile?.(),
@@ -433,6 +641,14 @@ export default function (pi: ExtensionAPI) {
         pi,
         piDir,
         sessionId,
+        onStoreFailure: (databasePath, error) => {
+          // Common with several sessions open: another one holds that store.
+          ignoreStaleExtensionCtx(() =>
+            warnUser(
+              ctx,
+              `[pi-task] durable resume skipped for ${databasePath || "a recorded store"}: ${errorMessageOf(error)}`,
+            ));
+        },
         modelRegistry: ctx.modelRegistry,
         enqueueDelivery: (deliveryId, delivery) =>
           completionDeliveryQueue.enqueue(deliveryId, delivery),
@@ -673,6 +889,10 @@ export default function (pi: ExtensionAPI) {
         // enumeration belongs to task execution, never extension load.
         .getAllTools()) {
         if (!tool.name || tool.name === taskToolName) continue;
+        // With messaging on, `agents` is pi-task's own: durable children get a
+        // native copy (never a re-hosted one acting as the main agent), and
+        // other children cannot host it.
+        if (messaging && tool.name === AGENTS_TOOL_NAME) continue;
         parentToolNames.push(tool.name);
         if (
           (tool.exposure === "direct" || tool.exposure === "model-only") &&

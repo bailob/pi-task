@@ -11,7 +11,7 @@
 
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { readTaskSessionHistory } from "../conversation.js";
@@ -30,6 +30,15 @@ import {
 	loadDurableParentToolBridge,
 	loadParentExtensionTools,
 } from "./durable-parent-tools.js";
+import { acquireDurableStoreLock, isDurableStoreLockedError } from "./durable-store-lock.js";
+import {
+  AGENTS_TOOL_NAME,
+  agentsParametersSchema,
+  agentsToolDescription,
+  getAgentMessagingService,
+  type AgentCapabilities,
+  type AgentsParams,
+} from "../agent-messaging.js";
 import type {
   ChildBuiltinCommand,
   ChildBuiltinCommandResult,
@@ -338,6 +347,9 @@ async function durableToolRegistrations(
   },
 ): Promise<import("@earendil-works/pi-durable").ToolRegistration[]> {
   const available = new Map(handle.toolRegistrations.map((tool) => [tool.name, tool]));
+  // Agent messaging is opt-in: while it is off the tool is never offered.
+  const messagingEnabled = getAgentMessagingService() !== undefined;
+  if (!messagingEnabled) available.delete(AGENTS_TOOL_NAME);
   // Containment holds by construction: the child only ever receives names from
   // `available`, minus the deny list. Names the durable harness cannot host
   // (extension-runtime tools such as codemode or peer) fail open and are
@@ -363,10 +375,15 @@ async function durableToolRegistrations(
   // Without an explicit allowlist the durable surface stays the four CodingTools:
   // resolveAgent composes every installed extension when `tools` is unset, so
   // leaving it unset would silently widen the default surface to the bridge.
+  // With messaging on, the default surface also gets `agents`; an explicit
+  // `tools:` list stays exact and must name it.
+  const defaultTools = messagingEnabled
+    ? ["read", "write", "edit", "bash", AGENTS_TOOL_NAME]
+    : ["read", "write", "edit", "bash"];
   const requestedNames = (
     parseToolList(input.tools).length > 0
       ? parseToolList(input.tools)
-      : ["read", "write", "edit", "bash"]
+      : defaultTools
   ).filter((name) => !disallowedTools.includes(name));
   // Host requested parent extension tools whose registration modules are known:
   // the module is re-invoked against a capture shim (never the live parent API)
@@ -407,7 +424,7 @@ async function durableToolRegistrations(
     for (const tool of bridged) available.set(tool.name, tool);
   }
   const allowedNames = resolveAgentToolAllowlist({
-    tools: parseToolList(input.tools).length > 0 ? input.tools : ["read", "write", "edit", "bash"],
+    tools: parseToolList(input.tools).length > 0 ? input.tools : defaultTools,
     disallowedTools,
     parentToolNames: [...available.keys()],
   });
@@ -438,8 +455,45 @@ function taskIdFromRequestId(requestId: unknown): string | undefined {
   }
 }
 
+/** The legacy project-wide store; new tasks use a per-session store. */
 export function durableDatabasePath(piDir: string): string {
   return join(piDir, "durable", "tasks.sqlite");
+}
+
+/**
+ * The store for new durable tasks of one Pi session, relative to `piDir`.
+ * One store per session, so concurrent sessions in a project never share one
+ * (pi-durable allows one owning process per store). Without a session id,
+ * tasks keep using the legacy project store.
+ */
+export function durableSessionStore(sessionId: string | undefined): string | undefined {
+  if (!sessionId) return undefined;
+  return `durable/sessions/${sessionId.replace(/[^A-Za-z0-9._-]/g, "_")}.sqlite`;
+}
+
+/** Absolute path of a recorded store; it must stay inside `<piDir>/durable/`. */
+export function resolveDurableStorePath(piDir: string, durableStore: string | undefined): string {
+  if (durableStore === undefined) return durableDatabasePath(piDir);
+  const durableDir = resolve(piDir, "durable");
+  const resolved = resolve(piDir, durableStore);
+  if (!resolved.startsWith(durableDir + sep)) {
+    throw new Error(`Durable store ${JSON.stringify(durableStore)} is outside ${durableDir}.`);
+  }
+  return resolved;
+}
+
+/** The store holding `taskId`'s child, as recorded in task history. */
+export function durableStorePathForTask(piDir: string, taskId: string): string {
+  const history = readTaskSessionHistory(piDir).find((entry) => entry.id === taskId);
+  return resolveDurableStorePath(piDir, history?.durableStore);
+}
+
+function taskStoreOptions<T extends { databasePath?: string }>(
+  piDir: string,
+  taskId: string,
+  options: T,
+): T & { databasePath: string } {
+  return { ...options, databasePath: options.databasePath ?? durableStorePathForTask(piDir, taskId) };
 }
 
 export type DurableDatabasePathInspection =
@@ -542,23 +596,42 @@ export async function openDurableHarness(
       name: parentToolBridge.name,
       tools: parentToolBridge.tools,
     }));
-    const storage = await sqlite.openNodeSqliteStorage(databasePath);
-    const harness = await durable.Harness.open(
-      storage,
-      {
-        models,
-        registry,
-        settings: { get retry() { return retrySettingsSource(); } },
-        onReport: (error: unknown) => {
-          console.error(
-            `[pi-task] durable harness report: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        },
-        env: ({ cwd }: { cwd?: string }) =>
-          new NodeExecutionEnv({ cwd: cwd ?? process.cwd() }),
-      },
-      chordContext.BACKGROUND_CONTEXT,
+    // Installed in every store, whatever the opt-in: stored conversations
+    // resolve tool names against the live registry, and resume() runs at open.
+    // Only the per-run allowlist decides who is offered it.
+    let callerTaskId: ((conversationId: ConversationId) => Promise<string | undefined>) | undefined;
+    const agentsTool = agentsDurableTool((conversationId) =>
+      callerTaskId ? callerTaskId(conversationId) : Promise.resolve(undefined),
     );
+    registry.install(durable.defineExtension({ name: "pi-task-agent-messaging", tools: [agentsTool] }));
+    // One process owns a store: pi-durable has no cross-process locking, and
+    // `harness.resume()` below would rerun another live process's work.
+    const releaseLock = await acquireDurableStoreLock(databasePath);
+    const openStore = async () => {
+      const storage = await sqlite.openNodeSqliteStorage(databasePath);
+      const harness = await durable.Harness.open(
+        storage,
+        {
+          models,
+          registry,
+          settings: { get retry() { return retrySettingsSource(); } },
+          onReport: (error: unknown) => {
+            console.error(
+              `[pi-task] durable harness report: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          },
+          env: ({ cwd }: { cwd?: string }) =>
+            new NodeExecutionEnv({ cwd: cwd ?? process.cwd() }),
+        },
+        chordContext.BACKGROUND_CONTEXT,
+      );
+      return { storage, harness };
+    };
+    const { storage, harness } = await openStore().catch((error: unknown) => {
+      releaseLock();
+      throw error;
+    });
+    harness.closed.then(releaseLock, releaseLock);
     // Continue any work interrupted by a previous process.
     harness.resume();
     const children = durable.defineDoc<{
@@ -578,6 +651,15 @@ export async function openDurableHarness(
       initial: () => ({ byRequestId: {}, activeByTask: {} }),
     });
     const context = chordContext.BACKGROUND_CONTEXT as ChordContext;
+    callerTaskId = async (conversationId) => {
+      const map = await harness.snapshot(children, context);
+      for (const [ownerKey, child] of Object.entries(map?.byOwner ?? {})) {
+        if (child.conversationId === conversationId && ownerKey.startsWith("pi-task:")) {
+          return ownerKey.slice("pi-task:".length);
+        }
+      }
+      return undefined;
+    };
     return {
       harness,
       module: durable,
@@ -592,6 +674,7 @@ export async function openDurableHarness(
       toolRegistrations: [
         ...(CodingTools.tools ?? []),
         ...(parentToolBridge?.tools ?? []),
+        agentsTool,
       ],
     };
   })();
@@ -645,6 +728,125 @@ async function findOrCreateChild(
     map.byOwner[ownerKey] = { conversationId: created.id };
     return created.id;
   }, handle.context);
+}
+
+/**
+ * The `agents` tool as durable children see it. It resolves the calling
+ * child from its conversation and hands off to the parent's messaging
+ * service; replay stays "unsafe" (a crash mid-send reports interrupted).
+ */
+function agentsDurableTool(
+  callerTaskId: (conversationId: ConversationId) => Promise<string | undefined>,
+): import("@earendil-works/pi-durable").ToolRegistration {
+  const result = (text: string, isError?: boolean) => ({
+    output: [{ type: "text" as const, text }],
+    ...(isError ? { isError: true } : {}),
+  });
+  return {
+    name: AGENTS_TOOL_NAME,
+    description: agentsToolDescription,
+    parameters: agentsParametersSchema(),
+    execute: async (args: unknown, api: { conversationId: ConversationId }) => {
+      const service = getAgentMessagingService();
+      if (!service) return result("Agent messaging is disabled.", true);
+      const taskId = await callerTaskId(api.conversationId);
+      if (!taskId) return result("This conversation is not a pi-task subagent.", true);
+      const outcome = await service.handle({ kind: "child", taskId }, args as AgentsParams);
+      return result(outcome.text, outcome.isError);
+    },
+  } as unknown as import("@earendil-works/pi-durable").ToolRegistration;
+}
+
+/**
+ * Durable access for agent messaging. It only touches stores this process
+ * already owns, plus this session's own store for reads: opening any other
+ * store would claim it and resume another session's work.
+ */
+export function createDurableMessagingAccess(input: {
+  piDir: string;
+  sessionId: () => string | undefined;
+  modelRegistry?: () => DurableRuntimeModelRegistry | undefined;
+  models?: DurableModelsFactory;
+}): {
+  steerDurable(taskId: string, text: string): Promise<string | null>;
+  readDurableLast(taskId: string): Promise<string | undefined>;
+  capabilities(taskId: string): Promise<AgentCapabilities | undefined>;
+} {
+  const options = () => ({
+    ...(input.models ? { models: input.models } : {}),
+    modelRegistry: input.modelRegistry?.(),
+  });
+  const openHere = (taskId: string) => isDurableStoreOpen(durableStorePathForTask(input.piDir, taskId));
+  return {
+    steerDurable: async (taskId, text) =>
+      openHere(taskId)
+        ? steerDurableTask(input.piDir, taskId, text, options())
+        : `Durable task ${taskId} is not running in this Pi process.`,
+    readDurableLast: async (taskId) => {
+      const store = durableSessionStore(input.sessionId());
+      const own = store === undefined ? undefined : resolveDurableStorePath(input.piDir, store);
+      if (!openHere(taskId) && durableStorePathForTask(input.piDir, taskId) !== own) {
+        throw new Error(`The store of ${taskId} is not open in this Pi process; its messages are unavailable here.`);
+      }
+      return readDurableTaskLastAssistantText(input.piDir, taskId, options());
+    },
+    capabilities: async (taskId) =>
+      openHere(taskId) ? durableTaskCapabilities(input.piDir, taskId, options()) : undefined,
+  };
+}
+
+/** True when this process has `databasePath` open, so it owns that store. */
+export function isDurableStoreOpen(databasePath: string): boolean {
+  return harnessCache.has(databasePath);
+}
+
+/** Offered tool names and cwd of a durable task's child conversation. */
+async function durableTaskCapabilities(
+  piDir: string,
+  taskId: string,
+  options: {
+    databasePath?: string;
+    models?: DurableModelsFactory;
+    modelRegistry?: DurableRuntimeModelRegistry;
+  } = {},
+): Promise<AgentCapabilities | undefined> {
+  const handle = await openDurableHarness(piDir, taskStoreOptions(piDir, taskId, options));
+  const conversation = await findChild(handle, taskId);
+  if (!conversation) return undefined;
+  const agent = await conversation.agent(handle.context);
+  return {
+    tools: agent.tools.map((tool) => tool.name),
+    ...(agent.cwd !== undefined ? { cwd: agent.cwd } : {}),
+  };
+}
+
+/** Text of a durable task's last assistant message, from its recorded store. */
+export async function readDurableTaskLastAssistantText(
+  piDir: string,
+  taskId: string,
+  options: {
+    databasePath?: string;
+    models?: DurableModelsFactory;
+    modelRegistry?: DurableRuntimeModelRegistry;
+  } = {},
+): Promise<string | undefined> {
+  const handle = await openDurableHarness(piDir, taskStoreOptions(piDir, taskId, options));
+  const conversation = await findChild(handle, taskId);
+  if (!conversation) return undefined;
+  let cursor: import("@earendil-works/pi-durable").Cursor | undefined;
+  do {
+    const page = await conversation.entries({ order: "descending" }, 50, cursor, handle.context);
+    for (const entry of page.items) {
+      if (entry.kind !== "pi.assistant") continue;
+      const message = entry.model?.[0] as { content?: { type: string; text?: string }[] } | undefined;
+      const text = (message?.content ?? [])
+        .flatMap((c) => (c.type === "text" && c.text ? [c.text] : []))
+        .join("");
+      if (text) return text;
+    }
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return undefined;
 }
 
 /**
@@ -730,7 +932,10 @@ export type DurableAdmissionState =
       kind: "unadmitted";
       reason: "storage-missing" | "child-missing" | "submission-missing";
     }
-  | { kind: "unknown"; reason: "request-id-missing" | "storage-unreadable" };
+  | {
+      kind: "unknown";
+      reason: "request-id-missing" | "storage-unreadable" | "storage-locked";
+    };
 
 /** Check the exact current durable request without creating child state. */
 export async function inspectDurableTaskAdmission(
@@ -743,7 +948,7 @@ export async function inspectDurableTaskAdmission(
     modelRegistry?: DurableRuntimeModelRegistry;
   } = {},
 ): Promise<DurableAdmissionState> {
-  const databasePath = options.databasePath ?? durableDatabasePath(piDir);
+  const databasePath = options.databasePath ?? durableStorePathForTask(piDir, taskId);
   const storage = inspectDurableDatabasePath(databasePath);
   if (storage.kind === "missing") {
     return { kind: "unadmitted", reason: "storage-missing" };
@@ -753,7 +958,14 @@ export async function inspectDurableTaskAdmission(
   }
   if (!requestId) return { kind: "unknown", reason: "request-id-missing" };
 
-  const handle = await openDurableHarness(piDir, { ...options, databasePath });
+  let handle: DurableHarnessHandle;
+  try {
+    handle = await openDurableHarness(piDir, { ...options, databasePath });
+  } catch (error) {
+    // The live owner may still be admitting this request; it is not provably absent.
+    if (isDurableStoreLockedError(error)) return { kind: "unknown", reason: "storage-locked" };
+    throw error;
+  }
   const children = await handle.harness.snapshot(handle.children, handle.context);
   const childId = children?.byOwner[durableOwnerKey(taskId)]?.conversationId;
   if (childId === undefined) return { kind: "unadmitted", reason: "child-missing" };
@@ -778,7 +990,7 @@ export async function releaseUnadmittedDurableRun(
     modelRegistry?: DurableRuntimeModelRegistry;
   } = {},
 ): Promise<boolean> {
-  const handle = await openDurableHarness(piDir, options);
+  const handle = await openDurableHarness(piDir, taskStoreOptions(piDir, taskId, options));
   const conversation = await findChild(handle, taskId);
   if (!conversation) return true;
   const observed = await handle.harness.snapshot(
@@ -1470,7 +1682,7 @@ export async function runDurableTask(input: {
   signal?: AbortSignal;
 }): Promise<DurableRunResult> {
   const handle = await openDurableHarness(input.piDir, {
-    databasePath: input.databasePath,
+    databasePath: input.databasePath ?? durableStorePathForTask(input.piDir, input.taskId),
     models: input.models,
     modelRegistry: input.modelRegistry,
     fast: input.fast,
@@ -1838,7 +2050,7 @@ export async function steerDurableTask(
     modelRegistry?: DurableRuntimeModelRegistry;
   } = {},
 ): Promise<string | null> {
-  const handle = await openDurableHarness(piDir, options);
+  const handle = await openDurableHarness(piDir, taskStoreOptions(piDir, taskId, options));
   const conversation = await findChild(handle, taskId);
   if (!conversation) return `No durable child conversation for task ${taskId}.`;
 
@@ -1976,7 +2188,9 @@ export async function readDurableTaskHistoryTranscript(
     modelRegistry?: DurableRuntimeModelRegistry;
   } = {},
 ): Promise<DurableChildHistoryTranscript> {
-  const handle = await openDurableHarness(piDir, options);
+  // Browsing covers the current task's store; other sessions' stores are
+  // owned by their processes and are not claimed from here.
+  const handle = await openDurableHarness(piDir, taskStoreOptions(piDir, currentTaskId, options));
   const { entries } = await scopedDurableHistory(handle, piDir, currentTaskId);
   const selected = entries.find((entry) => entry.id === selectedTaskId);
   if (!selected?.conversationId) {
@@ -2049,7 +2263,8 @@ export async function executeDurableChildBuiltinCommand(
   const info = (message: string): ChildBuiltinCommandResult => ({ level: "info", message });
   const failure = (message: string): ChildBuiltinCommandResult => ({ level: "error", message });
   try {
-    const handle = await openDurableHarness(piDir, options);
+    const storeOptions = taskStoreOptions(piDir, taskId, options);
+    const handle = await openDurableHarness(piDir, storeOptions);
     const conversation = await findChild(handle, taskId);
     if (!conversation) return failure(`No durable child conversation for task ${taskId}.`);
 
@@ -2203,7 +2418,7 @@ export async function executeDurableChildBuiltinCommand(
         : undefined;
       const sessionInfo: ChildSessionInfo = {
         sessionId: String(conversation.id),
-        storagePath: options.databasePath ?? durableDatabasePath(piDir),
+        storagePath: storeOptions.databasePath,
         ...(model ? { model } : {}),
         ...(agent.thinkingLevel ? { thinkingLevel: agent.thinkingLevel } : {}),
         ...(agent.cwd ? { cwd: agent.cwd } : {}),
@@ -2255,7 +2470,7 @@ export async function abortDurableTask(
     modelRegistry?: DurableRuntimeModelRegistry;
   } = {},
 ): Promise<string | null> {
-  const handle = await openDurableHarness(piDir, options);
+  const handle = await openDurableHarness(piDir, taskStoreOptions(piDir, taskId, options));
   const conversation = await findChild(handle, taskId);
   if (!conversation) return `No durable child conversation for task ${taskId}.`;
   await conversation.abort(handle.context);

@@ -33,6 +33,8 @@ export interface SdkBackgroundTaskInput<
   ownerLeafId?: string | null;
   backend?: TaskSessionHistoryEntry["backend"];
   durableRequestId?: string;
+  /** Durable store holding the child, recorded from the first history write. */
+  durableStore?: string;
   comparisonGroupId?: string;
   comparisonModel?: string;
   comparisonDescription?: string;
@@ -102,6 +104,9 @@ export function startSdkBackgroundTask<TResult extends SdkBackgroundResult>(
       backend: input.backend ?? "sdk",
       ...(input.durableRequestId !== undefined
         ? { durableRequestId: input.durableRequestId }
+        : {}),
+      ...(input.durableStore !== undefined
+        ? { durableStore: input.durableStore }
         : {}),
       ownerSessionId: input.ownerSessionId,
       ownerLeafId: input.ownerLeafId,

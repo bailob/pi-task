@@ -225,6 +225,11 @@ export interface TaskSessionHistoryEntry extends RegistryEntry {
   resultValid?: boolean;
   /** Exact durable submission identity written before child admission. */
   durableRequestId?: string;
+  /**
+   * Durable store holding this task's child, relative to `piDir`
+   * (`durable/sessions/<session>.sqlite`). Absent: the legacy project store.
+   */
+  durableStore?: string;
   completedAt?: number;
   /** Durable child's last observed whole-run TPS, recorded so read-only history can show it. */
   tokensPerSecond?: number;

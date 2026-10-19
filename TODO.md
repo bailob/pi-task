@@ -1,5 +1,8 @@
 # TODO
 
+- [x] Agent messaging, steps 0–2 (uncommitted; see CHANGELOG Unreleased). Durable store lock (`src/subagent/durable-store-lock.ts`), one store per session, in-session messaging (`src/agent-messaging.ts`), cross-session mesh (`src/session-mesh.ts`). Verified by tests and live on two Pi sessions.
+- [ ] Deferred from agent messaging: socket-lock fallback for filesystems that cannot host sockets; Windows untested; legacy-row store-gate edge cases; session-id sanitization can collide (the lock refuses); history browsing is scoped to one store; no close-on-idle (a process keeps the stores it opened until exit); a narrow capability-check vs steer race when a run is replaced; `read` of this session's own store can resume its work; the inbox count check is not atomic.
+
 - [x] Fix #30: terminal Pi resumes get a fresh per-request turn budget; preserve lifetime stats and baseline/grace across parent restart. Parent verified 715/715 tests, typecheck/build/smoke and regression RED on pre-fix source; independent review has no blockers. No live model/TUI validation. Work record: [.pi/artifacts/TODO.md](.pi/artifacts/TODO.md).
 
 - [x] Prepare v0.11.8: shorter `task` tool description guidance and dev dependencies on Pi 1.3.0; typecheck, tests, build and tarball verified locally. npm publish remains manual.
