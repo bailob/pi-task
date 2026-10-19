@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-19
+
 ### Added
 
 - Experimental in-session agent messaging (`PI_TASK_AGENT_MESSAGING=1` or
