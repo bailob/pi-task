@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-22
+
+### Changed
+
+- Requires Pi `pi-ai` and `pi-coding-agent` 1.4.0 or newer (the peer ranges
+  were `*`). pi-task is built and tested against Pi and pi-durable 1.4.0.
+- Fast mode forwards the request's `telemetry` and `identity` options, which
+  pi-ai 1.4 renamed from `telemetryContext` and added for attribution headers.
+- The durable child and run-lifecycle documents store a checkpoint every 64
+  deltas, so a long-lived store and its cold-read replay no longer grow with
+  every child or task. pi-durable 1.4.0 migrates an existing store when it is
+  opened; the migration is one-way.
+
+### Fixed
+
+- The durable backend failed to open on pi-ai 1.4 with `Cannot read properties
+  of undefined (reading 'bind')`, because pi-ai now binds `Models.getAuth`
+  eagerly and the durable model adapter did not provide it.
+- A durable task is no longer parked after five consecutive Pi exits while it
+  runs. pi-durable 1.4.0 parks such a task and pi-task never retries a parked
+  task, so it would have stayed stuck.
+
 ## [0.12.0] - 2026-10-19
 
 ### Added
