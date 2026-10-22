@@ -87,7 +87,7 @@ type DurableRunState = {
 /** Pi's request-time-authenticated model surface used by durable runs. */
 export type DurableRuntimeModelRegistry = Pick<
   import("@earendil-works/pi-coding-agent").ExtensionContext["modelRegistry"],
-  "getAll" | "find" | "streamSimple"
+  "getAll" | "find" | "streamSimple" | "getProviderAuth"
 >;
 
 /** Test seam: build the harness model registry instead of createModels(). */
@@ -282,7 +282,13 @@ export function createPiRuntimeModels(
   };
   const adapter: Pick<
     Models,
-    "getAllModels" | "getModel" | "streamSimple" | "completeSimple" | "fetchDeferred" | "cancelDeferred"
+    | "getAllModels"
+    | "getModel"
+    | "getAuth"
+    | "streamSimple"
+    | "completeSimple"
+    | "fetchDeferred"
+    | "cancelDeferred"
   > = {
     getAllModels: (provider) => {
       const registry = registryRef.current;
@@ -295,6 +301,16 @@ export function createPiRuntimeModels(
       return registry
         ? registry.find(provider, modelId)
         : fallbackModels().getModel(provider, modelId);
+    },
+    // pi-ai >=1.4 binds every Models method when it wraps the harness's Models for
+    // attribution, so a missing getAuth fails Harness.open with "Cannot read properties
+    // of undefined (reading 'bind')". pi-durable itself never calls it.
+    getAuth: async (providerOrModel, overrides) => {
+      const registry = registryRef.current;
+      if (!registry) return fallbackModels().getAuth(providerOrModel as never, overrides);
+      const providerId =
+        typeof providerOrModel === "string" ? providerOrModel : providerOrModel.provider;
+      return registry.getProviderAuth(providerId);
     },
     streamSimple: (model, context, options) => {
       const registry = registryRef.current;
@@ -327,8 +343,9 @@ export function createPiRuntimeModels(
       return fallbackModels().cancelDeferred(model, handle, options);
     },
   };
-  // This cast stays at the adapter boundary: pi-durable 1.0.0 calls only the
-  // six Models methods implemented above for generation and compaction.
+  // This cast stays at the adapter boundary: pi-durable calls only these Models
+  // methods for generation and compaction; the pi-ai >=1.4 attribution wrap also
+  // binds the rest (see getAuth).
   return adapter as unknown as Models;
 }
 
@@ -614,7 +631,12 @@ export async function openDurableHarness(
         {
           models,
           registry,
-          settings: { get retry() { return retrySettingsSource(); } },
+          // pi-task never closes the harness (it only observes `closed`), so every Pi exit
+          // during a run counts as a crash restart: streamed deltas do not reset the count,
+          // only a committed task state does. The 1.4.0 guard parks a task after five such
+          // restarts in a row, and pi-task never calls retryTask(), so a parked task would stay
+          // stuck behind one log line. Keep the pre-1.4 behavior here and park nothing.
+          settings: { restartLimit: Infinity, get retry() { return retrySettingsSource(); } },
           onReport: (error: unknown) => {
             console.error(
               `[pi-task] durable harness report: ${error instanceof Error ? error.message : String(error)}`,
@@ -641,6 +663,10 @@ export async function openDurableHarness(
       version: 1,
       scope: "session",
       initial: () => ({ byOwner: {} }),
+      // The value keeps every child ever created, and a session-scoped doc is current-only:
+      // each base replaces all stored rows. Without one, both the rows and the cold-read
+      // replay grow with every child, so bound them the same way runsDoc does.
+      checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
     });
     const runsDoc = durable.defineDoc<DurableRunState>({
       kind: "pi-task.run-lifecycle",
@@ -649,6 +675,9 @@ export async function openDurableHarness(
       history: "latest",
       fork: "current",
       initial: () => ({ byRequestId: {}, activeByTask: {} }),
+      // Every admission and settlement rewrites a request entry, so a conversation that runs
+      // many tasks accumulates deltas; store a base once a chain gets long enough to replay.
+      checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
     });
     const context = chordContext.BACKGROUND_CONTEXT as ChordContext;
     callerTaskId = async (conversationId) => {

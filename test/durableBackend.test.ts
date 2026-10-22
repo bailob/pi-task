@@ -16,6 +16,7 @@ import test from "node:test";
 
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { withClientIdentity } from "@earendil-works/pi-ai/utils/identity";
 
 import {
   abortDurableTask,
@@ -4094,6 +4095,32 @@ test("durable models adapter injects an opencode routing session id", () => {
   );
   assert.equal(captured[1]?.sessionId, undefined, "non-opencode providers are untouched");
   assert.equal(captured[2]?.sessionId, "explicit", "an explicit session id wins");
+});
+
+test("the durable models adapter survives pi-ai's eager attribution wrap", async () => {
+  // pi-ai >=1.4 wraps a harness's Models with withClientIdentity, which binds
+  // getAuth eagerly. A missing getAuth therefore fails Harness.open with
+  // "Cannot read properties of undefined (reading 'bind')" before any task
+  // starts, even though pi-durable never calls it. Use the real wrap rather than
+  // a hand-built stand-in, so a future eagerly-bound method fails here too.
+  const registry = {
+    getAll: () => [],
+    find: () => undefined,
+    streamSimple: () => ({}) as never,
+    getProviderAuth: async (provider: string) => ({ auth: { apiKey: `k-${provider}` }, source: "test" }),
+  };
+  const adapter = createPiRuntimeModels({ current: registry as never }, undefined);
+
+  const wrapped = withClientIdentity(adapter, {}) as typeof adapter;
+  assert.deepEqual(await wrapped.getAuth("anthropic" as never), {
+    auth: { apiKey: "k-anthropic" },
+    source: "test",
+  }, "getAuth resolves through Pi's registry after the wrap");
+  assert.deepEqual(
+    await wrapped.getAuth({ provider: "zai" } as never),
+    { auth: { apiKey: "k-zai" }, source: "test" },
+    "a model argument resolves by its provider",
+  );
 });
 
 test("durable Codex tasks request detailed reasoning summaries without changing effort", async () => {

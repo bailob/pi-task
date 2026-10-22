@@ -107,13 +107,19 @@ function buildFastBaseOptions(
     samplingParams,
     maxTokens,
     signal: options?.signal,
-    telemetryContext: options?.telemetryContext,
+    // pi-ai reads `telemetry` only in Models.stream/streamSimple, which start the
+    // request span before delegating to a provider streamer. Fast mode calls the
+    // streamer directly, so forwarding it is forward-compat, not instrumentation:
+    // no span is created here. `identity` is different — the provider streamers
+    // read it to build attribution headers, so it must be forwarded.
+    telemetry: options?.telemetry,
     apiKey: apiKey ?? options?.apiKey,
     fetch: options?.fetch,
     transport: options?.transport,
     cacheRetention: options?.cacheRetention,
     sessionId: options?.sessionId,
     headers: options?.headers,
+    identity: options?.identity,
     onPayload: options?.onPayload,
     onResponse: options?.onResponse,
     onProviderStreamEvent: options?.onProviderStreamEvent,
