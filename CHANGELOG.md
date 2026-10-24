@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- HerdR launches wait for the new pane's shell to start reading commands
+  before `agent start`: pi-task runs a short `echo` marker and waits for its
+  output (`shellReadyTimeoutMs`, default 10 s). `agent start` types the whole
+  agent command line into the pane, and HerdR rejects a line over 1024 bytes
+  while the shell is still loading its startup files, so a slow or busy shell
+  used to fail the launch with `agent_start_input_failed`. A shell that does
+  not become ready in time fails the launch, and its pane, or new grouped
+  workspace, is closed after the same ownership check as below.
+
 ### Fixed
 
 - A HerdR task whose `agent start` is rejected before any input reaches the
